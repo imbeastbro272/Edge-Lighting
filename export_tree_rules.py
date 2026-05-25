@@ -233,7 +233,7 @@ const TestCase TEST_CASES[] = {
  * Call this in setup() to verify the model works correctly
  */
 void validate_model() {
-  Serial.println("\\n=== Model Validation ===");
+  Serial.println(F("=== Model Validation ==="));
   float max_error = 0.0f;
   int failures = 0;
   
@@ -251,28 +251,28 @@ void validate_model() {
     if (error > max_error) max_error = error;
     if (error > 0.1) failures++;  // Allow small floating-point differences
     
-    Serial.print("Test ");
+    Serial.print(F("Test "));
     Serial.print(i + 1);
-    Serial.print(": Hour=");
+    Serial.print(F(": Hour="));
     Serial.print(tc.hour);
-    Serial.print(" Expected=");
+    Serial.print(F(" Expected="));
     Serial.print(tc.expected_brightness, 2);
-    Serial.print("% Predicted=");
+    Serial.print(F("% Predicted="));
     Serial.print(predicted, 2);
-    Serial.print("% Error=");
+    Serial.print(F("% Error="));
     Serial.print(error, 4);
-    Serial.println(error < 0.1 ? " PASS" : " FAIL");
+    Serial.println(error < 0.1 ? F(" PASS") : F(" FAIL"));
   }
   
-  Serial.println("\\n=== Validation Summary ===");
-  Serial.print("Tests: ");
+  Serial.println(F("=== Validation Summary ==="));
+  Serial.print(F("Tests: "));
   Serial.println(NUM_TEST_CASES);
-  Serial.print("Failures: ");
+  Serial.print(F("Failures: "));
   Serial.println(failures);
-  Serial.print("Max Error: ");
+  Serial.print(F("Max Error: "));
   Serial.print(max_error, 4);
-  Serial.println("%");
-  Serial.println(failures == 0 ? "✓ ALL TESTS PASSED" : "✗ SOME TESTS FAILED");
+  Serial.println(F("%"));
+  Serial.println(failures == 0 ? F("ALL TESTS PASSED") : F("SOME TESTS FAILED"));
   Serial.println();
 }
 

@@ -1,22 +1,43 @@
 /*
- * LED Brightness Controller with ML Decision Tree, Manual Override, and ON-DEVICE ONLINE LEARNING
+ * LED Brightness Controller with ML Decision Tree, Manual Override,
+ * Weekday-Aware ON-DEVICE ONLINE LEARNING, and Night-Ambient Policy
  *
  * The base predictor is a static Decision Tree exported to tree_rules.h.
- * On top of it, this sketch maintains a small per-context "correction table"
- * that is updated online whenever the user overrides the brightness with
- * the potentiometer. Corrections are persisted to ESP32 NVS so that the
- * device "remembers" the user's preferences across reboots.
+ * On top of it, this sketch maintains a small per-context "correction
+ * table" that is updated online whenever the user overrides the
+ * brightness with the potentiometer. Corrections are persisted to ESP32
+ * NVS so the device "remembers" preferences across reboots.
  *
- *   final_brightness = predict_brightness(...) + correction[ctx] + pot_offset
+ *   policy_target = predict_brightness(...) + correction[ctx] + pot_offset
  *
- * The context is defined by (time_period, motion_detected, ambient_bucket).
- * Online update rule (gradient-style absorption of the user's offset):
+ * Context (4 dimensions, 5x2x4x2 = 80 buckets):
+ *   - time_period      : 0..4  (Early-Morn, Morn, Aft, Eve, Night)
+ *   - motion_detected  : 0..1
+ *   - ambient_bucket   : 0..3  (Very-Dark, Dim, Medium, Bright)
+ *   - weekday_type     : 0=weekday, 1=weekend
  *
+ * Update rule (gradient-style absorption of the user's offset):
  *   correction[ctx] += LEARNING_RATE * pot_offset
  *
- * As correction[ctx] grows toward the user's preferred deviation, the LED
- * reaches the desired brightness even at pot=0; the user releases the pot,
- * pot_offset becomes 0, and learning naturally stops at the converged value.
+ * As correction[ctx] grows toward the user's preferred deviation the LED
+ * reaches the desired brightness even at pot=0. The user releases the
+ * pot, pot_offset becomes 0, and learning naturally stops at the
+ * converged value.
+ *
+ * Night-Ambient Policy:
+ *   At night (period 4) with high ambient light (bucket 3) AND no motion,
+ *   the LED target is forced to 0%. With smoothing this produces a
+ *   graceful fade rather than an abrupt switch-off. Motion presence
+ *   restores the normal ML+correction path. Online learning is paused
+ *   while the policy is active because the ML+pot signal is masked.
+ *
+ * Weekday Awareness:
+ *   The weekday_type dimension means the device learns separate
+ *   corrections for weekdays and weekends, so an evening-on-weekday
+ *   preference does not bleed into evening-on-weekend behaviour. (The
+ *   base tree itself is weekday-agnostic; for full weekday awareness in
+ *   the base model, retrain in train_model.py with a day_of_week feature
+ *   and regenerate tree_rules.h.)
  *
  * Hardware Required:
  *   - ESP32 (uses NVS via Preferences library)
@@ -51,7 +72,9 @@
 #define NUM_TIME_PERIODS    5
 #define NUM_MOTION_STATES   2
 #define NUM_AMBIENT_BUCKETS 4
-#define NUM_CONTEXTS        (NUM_TIME_PERIODS * NUM_MOTION_STATES * NUM_AMBIENT_BUCKETS)  // 40
+#define NUM_WEEKDAY_TYPES   2  // 0 = weekday (Mon-Fri), 1 = weekend (Sat/Sun)
+#define NUM_CONTEXTS        (NUM_TIME_PERIODS * NUM_MOTION_STATES * \
+                             NUM_AMBIENT_BUCKETS * NUM_WEEKDAY_TYPES)  // 80
 
 const float         LEARNING_RATE         = 0.02f;   // Per-update absorption rate
 const float         CORRECTION_CAP        = 50.0f;   // Max |correction| in %
@@ -60,6 +83,16 @@ const int           LEARN_OFFSET_NOISE    = 3;       // Pot fluctuation toleranc
 const unsigned long LEARN_STABLE_MS       = 2000UL;  // Pot must be stable this long before we learn
 const unsigned long NVS_SAVE_INTERVAL_MS  = 30000UL; // Throttle flash writes to every 30 s
 const char* const   NVS_NAMESPACE         = "led-learn";
+
+// Bump this if NUM_CONTEXTS or the (period, motion, ambient, weekday) layout
+// ever changes. On mismatch the saved table is wiped to avoid mis-mapped indices.
+const uint32_t      LEARN_DATA_VERSION    = 2;
+
+// ----- Night-ambient policy -----
+// At night with bright ambient light AND no motion, the LED is unnecessary;
+// force the target to 0 (smoothing fades the LED gracefully).
+const int           NIGHT_PERIOD          = 4;       // matches getTimePeriod()
+const int           HIGH_AMBIENT_BUCKET   = 3;       // matches getAmbientBucket()
 
 // RTC
 RTC_DS3231 rtc;
@@ -133,16 +166,18 @@ void setup() {
   prev_offset_for_stability = readManualOffset();
   offset_stable_since = millis();
 
-  Serial.println(F("\n=== Manual Time Setting ==="));
-  Serial.println(F("Type: settime HH:MM:SS (example: settime 14:30:00)"));
+  Serial.println(F("\n=== Manual Time / Date Setting ==="));
+  Serial.println(F("Type: settime HH:MM:SS    (example: settime 14:30:00)"));
+  Serial.println(F("Type: setdate YYYY-MM-DD  (example: setdate 2026-05-25)"));
   Serial.println(F("Type: help (for all commands)"));
 
   Serial.println(F("\n=== Starting Continuous Monitoring ===\n"));
-  Serial.println(F("Legend: ML% = base tree prediction, Corr = learned correction, "));
-  Serial.println(F("        Off = current pot offset, L = learned this cycle"));
-  Serial.println(F("┌──────────┬──────┬─────────┬─────┬──────┬─────┬──────┬──────┬──────┬────────┬─────┬───┐"));
-  Serial.println(F("│   Time   │ Hour │ Ambient │ Mot │ Per. │ Bkt │  ML% │ Corr │ Off  │ Final% │ PWM │ L │"));
-  Serial.println(F("├──────────┼──────┼─────────┼─────┼──────┼─────┼──────┼──────┼──────┼────────┼─────┼───┤"));
+  Serial.println(F("Legend: ML% = base tree prediction, Corr = learned correction,"));
+  Serial.println(F("        Off = pot offset, WD = 0:weekday/1:weekend,"));
+  Serial.println(F("        AO = night-ambient override, L = learned this cycle"));
+  Serial.println(F("┌──────────┬────┬───────┬───┬───┬───┬────┬──────┬──────┬──────┬──────┬─────┬────┬───┐"));
+  Serial.println(F("│   Time   │ Hr │ Amb   │ M │ P │ B │ WD │  ML% │ Corr │  Off │ Final│ PWM │ AO │ L │"));
+  Serial.println(F("├──────────┼────┼───────┼───┼───┼───┼────┼──────┼──────┼──────┼──────┼─────┼────┼───┤"));
 }
 
 // =====================================================================
@@ -156,8 +191,9 @@ void loop() {
 
     // ----- Read sensors -----
     DateTime now = rtc.now();
-    int hour   = now.hour();
-    int minute = now.minute();
+    int hour    = now.hour();
+    int minute  = now.minute();
+    int dow_raw = now.dayOfTheWeek();    // 0=Sun, 1=Mon, ... 6=Sat (RTClib)
 
     float ambient_light  = readLDR();
     int   motion_detected = digitalRead(PIR_PIN);
@@ -167,11 +203,13 @@ void loop() {
     // ----- Time features -----
     float sin_hour = sin(2.0 * PI * hour / 24.0);
     float cos_hour = cos(2.0 * PI * hour / 24.0);
-    int   time_period = getTimePeriod(hour);
+    int   time_period  = getTimePeriod(hour);
+    int   weekday_type = getWeekdayType(dow_raw);  // 0=weekday, 1=weekend
 
     // ----- Context for online learning -----
     int ambient_bucket = getAmbientBucket(smoothed_ldr);
-    int ctx_idx        = getContextIndex(time_period, motion_detected, ambient_bucket);
+    int ctx_idx        = getContextIndex(time_period, motion_detected,
+                                         ambient_bucket, weekday_type);
 
     // ----- Base ML prediction (static tree) -----
     float ml_brightness = predict_brightness(
@@ -189,8 +227,21 @@ void loop() {
     // ----- Read manual override -----
     manual_offset = readManualOffset();
 
+    // ----- Night-ambient policy -----
+    // If it is night, ambient light is already plentiful, AND no one is
+    // around, we don't want the LED at all. The smoothing layer below
+    // turns this hard zero target into a graceful fade.
+    bool ambient_policy_active = isNightAmbientNoMotion(time_period,
+                                                        motion_detected,
+                                                        ambient_bucket);
+
     // ----- Compute final brightness -----
-    float raw_final = corrected_ml + manual_offset;
+    float raw_final;
+    if (ambient_policy_active) {
+      raw_final = 0.0f;                              // policy override
+    } else {
+      raw_final = corrected_ml + manual_offset;      // ML + correction + override
+    }
     float final_brightness = constrain(raw_final, 0, 100);
 
     // Smooth brightness changes
@@ -202,8 +253,10 @@ void loop() {
     analogWrite(LED_PIN, pwm_value);
 
     // ----- ONLINE LEARNING -----
+    // Skip learning while the night-ambient policy is forcing the output
+    // because the user's pot signal is being masked.
     bool learned_this_cycle = false;
-    if (learning_enabled) {
+    if (learning_enabled && !ambient_policy_active) {
       learned_this_cycle = maybeLearn(ctx_idx, manual_offset, raw_final, current_time);
     } else {
       // Keep the stability tracker fresh so a re-enable doesn't immediately fire
@@ -225,12 +278,15 @@ void loop() {
     char time_str[9];
     sprintf(time_str, "%02d:%02d:%02d", hour, minute, now.second());
 
-    char line[160];
+    char line[180];
     sprintf(line,
-      "│ %s │  %2d  │ %6.1f  │  %d  │  %d   │  %d  │ %4.1f │%+5.1f │%+5d │ %5.1f  │ %3d │ %s │",
-      time_str, hour, smoothed_ldr, motion_detected, time_period, ambient_bucket,
-      ml_brightness, learned_correction, manual_offset, final_brightness, pwm_value,
-      learned_this_cycle ? "*" : " ");
+      "│ %s │ %2d │%6.1f │ %d │ %d │ %d │ %d  │ %4.1f │%+5.1f │%+5d │%5.1f │ %3d │ %s │ %s │",
+      time_str, hour, smoothed_ldr,
+      motion_detected, time_period, ambient_bucket, weekday_type,
+      ml_brightness, learned_correction, manual_offset,
+      final_brightness, pwm_value,
+      ambient_policy_active ? "ON " : "off",
+      learned_this_cycle    ? "*"   : " ");
     Serial.println(line);
   }
 
@@ -251,12 +307,28 @@ int getAmbientBucket(float lux) {
   return 3;                      // Bright  (daylight / strong artificial)
 }
 
-// Compose a flat index from the three context dimensions.
-int getContextIndex(int time_period, int motion, int ambient_bucket) {
+// Compose a flat index from the four context dimensions.
+// Layout: ((period * MOTION + motion) * AMBIENT + ambient) * WEEKDAY + weekday
+int getContextIndex(int time_period, int motion, int ambient_bucket, int weekday_type) {
   if (time_period   < 0 || time_period   >= NUM_TIME_PERIODS)    time_period   = 0;
   if (motion        < 0 || motion        >= NUM_MOTION_STATES)   motion        = 0;
   if (ambient_bucket< 0 || ambient_bucket>= NUM_AMBIENT_BUCKETS) ambient_bucket= 0;
-  return (time_period * NUM_MOTION_STATES + motion) * NUM_AMBIENT_BUCKETS + ambient_bucket;
+  if (weekday_type  < 0 || weekday_type  >= NUM_WEEKDAY_TYPES)   weekday_type  = 0;
+  return (((time_period * NUM_MOTION_STATES + motion)
+           * NUM_AMBIENT_BUCKETS + ambient_bucket)
+           * NUM_WEEKDAY_TYPES + weekday_type);
+}
+
+// Map RTClib day-of-week (0=Sun .. 6=Sat) to weekday(0)/weekend(1).
+int getWeekdayType(int dow_raw) {
+  return (dow_raw == 0 || dow_raw == 6) ? 1 : 0;
+}
+
+// True when night + plenty of ambient light + nobody around.
+bool isNightAmbientNoMotion(int time_period, int motion, int ambient_bucket) {
+  return (time_period == NIGHT_PERIOD)
+      && (motion == 0)
+      && (ambient_bucket >= HIGH_AMBIENT_BUCKET);
 }
 
 // Decide whether to apply a learning step this cycle, and apply it if so.
@@ -298,15 +370,35 @@ void applyLearningUpdate(int ctx_idx, int pot_offset) {
 }
 
 // Load all corrections from NVS into RAM. Missing keys default to 0.
+// If the persisted schema version doesn't match LEARN_DATA_VERSION the
+// stored data refers to a different context layout (e.g. before the
+// weekday dimension was added) and is wiped to avoid mis-mapping.
 void loadCorrections() {
   for (int i = 0; i < NUM_CONTEXTS; i++) {
     correction_table[i] = 0.0f;
     correction_dirty[i] = false;
   }
 
-  if (!prefs.begin(NVS_NAMESPACE, true)) {
-    // Namespace doesn't exist yet — first run.
-    Serial.println(F("Online learning: no prior corrections found (first run)"));
+  // Open RW so we can migrate (clear + write version) on schema mismatch.
+  if (!prefs.begin(NVS_NAMESPACE, false)) {
+    Serial.println(F("Online learning: NVS unavailable, starting empty"));
+    return;
+  }
+
+  uint32_t stored_version = prefs.getUInt("ver", 0);
+  if (stored_version != LEARN_DATA_VERSION) {
+    if (stored_version == 0) {
+      Serial.println(F("Online learning: no prior corrections found (first run)"));
+    } else {
+      Serial.print(F("Online learning: schema changed ("));
+      Serial.print(stored_version);
+      Serial.print(F(" -> "));
+      Serial.print(LEARN_DATA_VERSION);
+      Serial.println(F("), clearing old NVS data"));
+    }
+    prefs.clear();
+    prefs.putUInt("ver", LEARN_DATA_VERSION);
+    prefs.end();
     return;
   }
 
@@ -341,6 +433,11 @@ void saveDirtyCorrections(bool force) {
     return;
   }
 
+  // Always make sure the version key is present (was wiped on schema change).
+  if (prefs.getUInt("ver", 0) != LEARN_DATA_VERSION) {
+    prefs.putUInt("ver", LEARN_DATA_VERSION);
+  }
+
   int written = 0;
   char key[8];
   for (int i = 0; i < NUM_CONTEXTS; i++) {
@@ -362,6 +459,7 @@ void saveDirtyCorrections(bool force) {
 void resetCorrections() {
   if (prefs.begin(NVS_NAMESPACE, false)) {
     prefs.clear();
+    prefs.putUInt("ver", LEARN_DATA_VERSION);
     prefs.end();
   }
   for (int i = 0; i < NUM_CONTEXTS; i++) {
@@ -378,26 +476,30 @@ void printCorrectionTable() {
   Serial.println(F("Period: 0=EarlyMorn 1=Morn 2=Aft 3=Eve 4=Night"));
   Serial.println(F("Motion: 0=None 1=Detected"));
   Serial.println(F("Bucket: 0=<50lx 1=50-300 2=300-800 3=>=800"));
-  Serial.println(F("┌────────┬────────┬────────┬────────────┐"));
-  Serial.println(F("│ Period │ Motion │ AmbBkt │ Correction │"));
-  Serial.println(F("├────────┼────────┼────────┼────────────┤"));
+  Serial.println(F("WD    : 0=Weekday 1=Weekend"));
+  Serial.println(F("┌────────┬────────┬────────┬────┬────────────┐"));
+  Serial.println(F("│ Period │ Motion │ AmbBkt │ WD │ Correction │"));
+  Serial.println(F("├────────┼────────┼────────┼────┼────────────┤"));
 
   int nonzero = 0;
   for (int p = 0; p < NUM_TIME_PERIODS; p++) {
     for (int m = 0; m < NUM_MOTION_STATES; m++) {
       for (int b = 0; b < NUM_AMBIENT_BUCKETS; b++) {
-        int idx = getContextIndex(p, m, b);
-        float val = correction_table[idx];
-        if (val != 0.0f) {
-          char row[80];
-          sprintf(row, "│   %d    │   %d    │   %d    │  %+8.2f%% │", p, m, b, val);
-          Serial.println(row);
-          nonzero++;
+        for (int w = 0; w < NUM_WEEKDAY_TYPES; w++) {
+          int idx = getContextIndex(p, m, b, w);
+          float val = correction_table[idx];
+          if (val != 0.0f) {
+            char row[96];
+            sprintf(row, "│   %d    │   %d    │   %d    │ %d  │  %+8.2f%% │",
+                    p, m, b, w, val);
+            Serial.println(row);
+            nonzero++;
+          }
         }
       }
     }
   }
-  Serial.println(F("└────────┴────────┴────────┴────────────┘"));
+  Serial.println(F("└────────┴────────┴────────┴────┴────────────┘"));
   Serial.print(F("Non-zero entries: "));
   Serial.print(nonzero);
   Serial.print(F(" / "));
@@ -476,6 +578,20 @@ void printDateTime(DateTime dt) {
   Serial.print(dt.second(), DEC);
 }
 
+// Map RTClib day-of-week (0=Sun..6=Sat) to a printable abbreviation.
+const __FlashStringHelper* dayName(int dow_raw) {
+  switch (dow_raw) {
+    case 0: return F("Sun");
+    case 1: return F("Mon");
+    case 2: return F("Tue");
+    case 3: return F("Wed");
+    case 4: return F("Thu");
+    case 5: return F("Fri");
+    case 6: return F("Sat");
+    default: return F("???");
+  }
+}
+
 // =====================================================================
 // SERIAL COMMANDS
 // =====================================================================
@@ -490,12 +606,22 @@ void handleSerialCommand() {
     Serial.print(F("Current Offset: "));     Serial.print(manual_offset);     Serial.println(F("%"));
     Serial.print(F("Learning updates: "));   Serial.println(learn_update_count);
     Serial.print(F("Learning state: "));     Serial.println(learning_enabled ? F("ENABLED") : F("DISABLED"));
+    DateTime now = rtc.now();
+    Serial.print(F("Today is: "));
+    Serial.print(dayName(now.dayOfTheWeek()));
+    Serial.print(F(" ("));
+    Serial.print(getWeekdayType(now.dayOfTheWeek()) == 1 ? F("weekend") : F("weekday"));
+    Serial.println(F(")"));
     Serial.println();
   } else if (cmd == "time") {
     DateTime now = rtc.now();
     Serial.print(F("Current time: "));
     printDateTime(now);
-    Serial.println();
+    Serial.print(F("  ["));
+    Serial.print(dayName(now.dayOfTheWeek()));
+    Serial.print(F(", "));
+    Serial.print(getWeekdayType(now.dayOfTheWeek()) == 1 ? F("weekend") : F("weekday"));
+    Serial.println(F("]"));
   } else if (cmd == "test") {
     validate_model();
   } else if (cmd == "corrections" || cmd == "corr") {
@@ -535,13 +661,44 @@ void handleSerialCommand() {
       Serial.println(F("Format: settime HH:MM:SS"));
       Serial.println(F("Example: settime 14:30:45"));
     }
+  } else if (cmd.startsWith("setdate ")) {
+    // Set date manually: setdate YYYY-MM-DD
+    // Needed so dayOfTheWeek() (used for weekday/weekend) is accurate.
+    String dateStr = cmd.substring(8);
+    dateStr.trim();
+    if (dateStr.length() == 10 && dateStr.charAt(4) == '-' && dateStr.charAt(7) == '-') {
+      int year  = dateStr.substring(0, 4).toInt();
+      int month = dateStr.substring(5, 7).toInt();
+      int day   = dateStr.substring(8, 10).toInt();
+      if (year >= 2000 && year < 2100 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+        DateTime now = rtc.now();
+        rtc.adjust(DateTime(year, month, day, now.hour(), now.minute(), now.second()));
+        DateTime updated = rtc.now();
+        Serial.print(F("Date set to: "));
+        Serial.print(year);  Serial.print(F("-"));
+        Serial.print(month); Serial.print(F("-"));
+        Serial.print(day);
+        Serial.print(F(" ("));
+        Serial.print(dayName(updated.dayOfTheWeek()));
+        Serial.println(F(")"));
+      } else {
+        Serial.println(F("Error: Invalid date values"));
+        Serial.println(F("Format: setdate YYYY-MM-DD"));
+      }
+    } else {
+      Serial.println(F("Error: Invalid date format"));
+      Serial.println(F("Format: setdate YYYY-MM-DD"));
+      Serial.println(F("Example: setdate 2026-05-25"));
+    }
   } else if (cmd == "help") {
     Serial.println(F("\n┌─────────────────────────────────────────────────────────────┐"));
     Serial.println(F("│                      COMMAND HELP                           │"));
     Serial.println(F("├─────────────────────────────────────────────────────────────┤"));
     Serial.println(F("│ settime HH:MM:SS  - Set time manually (24-hour format)      │"));
     Serial.println(F("│                     Example: settime 14:30:45               │"));
-    Serial.println(F("│ time              - Show current RTC time                   │"));
+    Serial.println(F("│ setdate YYYY-MM-DD- Set date (needed for weekday awareness) │"));
+    Serial.println(F("│                     Example: setdate 2026-05-25             │"));
+    Serial.println(F("│ time              - Show current RTC time + weekday         │"));
     Serial.println(F("│ stats             - Show prediction + learning statistics   │"));
     Serial.println(F("│ test              - Re-run model validation                 │"));
     Serial.println(F("│ corrections       - Print learned correction table          │"));

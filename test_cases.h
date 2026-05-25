@@ -36,7 +36,7 @@ const TestCase TEST_CASES[] = {
  * Call this in setup() to verify the model works correctly
  */
 void validate_model() {
-  Serial.println(F("\n=== Model Validation ==="));
+  Serial.println(F("=== Model Validation ==="));
   float max_error = 0.0f;
   int failures = 0;
   
@@ -67,7 +67,7 @@ void validate_model() {
     Serial.println(error < 0.1 ? F(" PASS") : F(" FAIL"));
   }
   
-  Serial.println(F("\n=== Validation Summary ==="));
+  Serial.println(F("=== Validation Summary ==="));
   Serial.print(F("Tests: "));
   Serial.println(NUM_TEST_CASES);
   Serial.print(F("Failures: "));
@@ -75,7 +75,7 @@ void validate_model() {
   Serial.print(F("Max Error: "));
   Serial.print(max_error, 4);
   Serial.println(F("%"));
-  Serial.println(failures == 0 ? F("✓ ALL TESTS PASSED") : F("✗ SOME TESTS FAILED"));
+  Serial.println(failures == 0 ? F("ALL TESTS PASSED") : F("SOME TESTS FAILED"));
   Serial.println();
 }
 

@@ -27,6 +27,7 @@ def load_and_validate_data(filepath):
     
     # Expected columns
     required_columns = ['ambient_light', 'motion_detected', 'sin_hour', 'cos_hour', 'time_period', 'led_brightness']
+    optional_columns = ['day_of_week']
     
     # Check for required columns
     missing_columns = [col for col in required_columns if col not in df.columns]
@@ -34,6 +35,14 @@ def load_and_validate_data(filepath):
         print(f"\n⚠️  Warning: Missing columns: {missing_columns}")
         print("Please ensure your dataset has all required columns.")
         sys.exit(1)
+    
+    # Add day_of_week if not present (will be added during training with random values)
+    if 'day_of_week' not in df.columns:
+        print("\n⚠️  'day_of_week' column not found in dataset.")
+        print("   Adding random day_of_week values for training...")
+        df['day_of_week'] = np.random.randint(0, 7, size=len(df))
+    
+    required_columns.append('day_of_week')
     
     # Data validation
     print("\n=== Data Statistics ===")
@@ -147,52 +156,73 @@ def test_predictions(controller):
     
     test_scenarios = [
         {
-            'name': 'Night + High Ambient Light (Synthetic Scenario)',
+            'name': 'Night + High Ambient Light + Motion (NEW RULE)',
             'ambient_light': 800,
             'motion_detected': 1,
             'hour': 22,  # 10 PM
+            'day_of_week': 1,  # Tuesday
+        },
+        {
+            'name': 'Night + High Ambient Light + NO Motion (NEW RULE)',
+            'ambient_light': 800,
+            'motion_detected': 0,
+            'hour': 22,  # 10 PM
+            'day_of_week': 1,  # Tuesday
         },
         {
             'name': 'Night + Low Ambient Light + Motion',
             'ambient_light': 50,
             'motion_detected': 1,
             'hour': 23,  # 11 PM
+            'day_of_week': 4,  # Friday
         },
         {
-            'name': 'Morning + Medium Ambient Light',
+            'name': 'Morning + Medium Ambient Light (Weekday)',
             'ambient_light': 400,
             'motion_detected': 1,
             'hour': 8,  # 8 AM
+            'day_of_week': 2,  # Wednesday
+        },
+        {
+            'name': 'Morning + Medium Ambient Light (Weekend)',
+            'ambient_light': 400,
+            'motion_detected': 1,
+            'hour': 8,  # 8 AM
+            'day_of_week': 6,  # Sunday
         },
         {
             'name': 'Evening + Motion',
             'ambient_light': 200,
             'motion_detected': 1,
             'hour': 18,  # 6 PM
+            'day_of_week': 0,  # Monday
         },
         {
             'name': 'Afternoon + High Ambient Light',
             'ambient_light': 900,
             'motion_detected': 0,
             'hour': 14,  # 2 PM
+            'day_of_week': 3,  # Thursday
         }
     ]
     
     from led_brightness_model import calculate_time_features
     
     for scenario in test_scenarios:
-        sin_hour, cos_hour, time_period = calculate_time_features(scenario['hour'])
+        sin_hour, cos_hour, time_period, _ = calculate_time_features(scenario['hour'])
         
         result = controller.predict(
             ambient_light=scenario['ambient_light'],
             motion_detected=scenario['motion_detected'],
             sin_hour=sin_hour,
             cos_hour=cos_hour,
-            time_period=time_period
+            time_period=time_period,
+            day_of_week=scenario['day_of_week']
         )
         
+        day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
         print(f"Scenario: {scenario['name']}")
-        print(f"  Inputs: Hour={scenario['hour']}h, Ambient={scenario['ambient_light']} lux, Motion={scenario['motion_detected']}")
+        print(f"  Inputs: {day_names[scenario['day_of_week']]} {scenario['hour']}h, Ambient={scenario['ambient_light']} lux, Motion={scenario['motion_detected']}")
         print(f"  → ML Predicted: {result['ml_predicted']}%")
         print(f"  → Final Brightness: {result['final_brightness']}%")
         print()

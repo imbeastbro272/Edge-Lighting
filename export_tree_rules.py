@@ -41,7 +41,7 @@ def tree_to_code(tree, feature_names):
             value = tree_.value[node][0][0]
             return f"{indent}return {value:.6f}f;\n"
     
-    code = "float predict_brightness(float ambient_light, int motion_detected, float sin_hour, float cos_hour, int time_period) {\n"
+    code = "float predict_brightness(float ambient_light, int motion_detected, float sin_hour, float cos_hour, int time_period, int day_of_week) {\n"
     code += recurse(0, 1)
     code += "}\n"
     
@@ -96,6 +96,7 @@ def export_model_to_arduino(model_path, output_path):
  *   sin_hour: Sine component of hour (sin(2*PI*hour/24))
  *   cos_hour: Cosine component of hour (cos(2*PI*hour/24))
  *   time_period: Time period code (0=Early Morning, 1=Morning, 2=Afternoon, 3=Evening, 4=Night)
+ *   day_of_week: Day of week (0=Monday, 1=Tuesday, ..., 6=Sunday)
  * 
  * Returns:
  *   Predicted LED brightness (0-100%)
@@ -158,16 +159,16 @@ def export_test_data(model_path, output_path, num_samples=10):
     
     # Generate diverse test cases
     scenarios = [
-        {'ambient': 50, 'motion': 1, 'hour': 22, 'period': 4},    # Night, low light, motion
-        {'ambient': 800, 'motion': 1, 'hour': 22, 'period': 4},   # Night, HIGH light, motion (synthetic)
-        {'ambient': 400, 'motion': 1, 'hour': 8, 'period': 1},    # Morning, medium light
-        {'ambient': 900, 'motion': 0, 'hour': 14, 'period': 2},   # Afternoon, high light, no motion
-        {'ambient': 200, 'motion': 1, 'hour': 18, 'period': 3},   # Evening, low light, motion
-        {'ambient': 30, 'motion': 0, 'hour': 5, 'period': 0},     # Early morning, very low light
-        {'ambient': 600, 'motion': 1, 'hour': 10, 'period': 1},   # Morning, bright
-        {'ambient': 100, 'motion': 0, 'hour': 23, 'period': 4},   # Late night, no motion
-        {'ambient': 500, 'motion': 1, 'hour': 16, 'period': 2},   # Late afternoon
-        {'ambient': 250, 'motion': 1, 'hour': 19, 'period': 3},   # Evening transition
+        {'ambient': 50, 'motion': 1, 'hour': 22, 'period': 4, 'day': 1},    # Night, low light, motion, Tuesday
+        {'ambient': 800, 'motion': 1, 'hour': 22, 'period': 4, 'day': 1},   # Night, HIGH light, motion, Tuesday (NEW RULE)
+        {'ambient': 800, 'motion': 0, 'hour': 22, 'period': 4, 'day': 1},   # Night, HIGH light, NO motion, Tuesday (NEW RULE)
+        {'ambient': 400, 'motion': 1, 'hour': 8, 'period': 1, 'day': 2},    # Morning, medium light, Wednesday
+        {'ambient': 900, 'motion': 0, 'hour': 14, 'period': 2, 'day': 3},   # Afternoon, high light, no motion, Thursday
+        {'ambient': 200, 'motion': 1, 'hour': 18, 'period': 3, 'day': 4},   # Evening, low light, motion, Friday
+        {'ambient': 30, 'motion': 0, 'hour': 5, 'period': 0, 'day': 0},     # Early morning, very low light, Monday
+        {'ambient': 600, 'motion': 1, 'hour': 10, 'period': 1, 'day': 5},   # Morning, bright, Saturday
+        {'ambient': 100, 'motion': 0, 'hour': 23, 'period': 4, 'day': 6},   # Late night, no motion, Sunday
+        {'ambient': 500, 'motion': 1, 'hour': 16, 'period': 2, 'day': 0},   # Late afternoon, Monday
     ]
     
     for scenario in scenarios:
@@ -182,7 +183,8 @@ def export_test_data(model_path, output_path, num_samples=10):
             'motion_detected': scenario['motion'],
             'sin_hour': sin_hour,
             'cos_hour': cos_hour,
-            'time_period': scenario['period']
+            'time_period': scenario['period'],
+            'day_of_week': scenario['day']
         }])
         
         prediction = model.predict(input_data)[0]
@@ -193,6 +195,7 @@ def export_test_data(model_path, output_path, num_samples=10):
             'sin_hour': sin_hour,
             'cos_hour': cos_hour,
             'time_period': scenario['period'],
+            'day_of_week': scenario['day'],
             'hour': hour,
             'expected_brightness': prediction
         })
@@ -212,6 +215,7 @@ struct TestCase {
   float sin_hour;
   float cos_hour;
   int time_period;
+  int day_of_week;
   int hour;
   float expected_brightness;
 };
@@ -224,7 +228,7 @@ const TestCase TEST_CASES[] = {
     for tc in test_cases:
         c_test_code += f"  {{{tc['ambient_light']:.2f}f, {tc['motion_detected']}, "
         c_test_code += f"{tc['sin_hour']:.6f}f, {tc['cos_hour']:.6f}f, {tc['time_period']}, "
-        c_test_code += f"{tc['hour']}, {tc['expected_brightness']:.6f}f}},\n"
+        c_test_code += f"{tc['day_of_week']}, {tc['hour']}, {tc['expected_brightness']:.6f}f}},\n"
     
     c_test_code += """};
 
@@ -237,6 +241,8 @@ void validate_model() {
   float max_error = 0.0f;
   int failures = 0;
   
+  const char* day_names[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+  
   for (int i = 0; i < NUM_TEST_CASES; i++) {
     TestCase tc = TEST_CASES[i];
     float predicted = predict_brightness(
@@ -244,7 +250,8 @@ void validate_model() {
       tc.motion_detected,
       tc.sin_hour,
       tc.cos_hour,
-      tc.time_period
+      tc.time_period,
+      tc.day_of_week
     );
     
     float error = abs(predicted - tc.expected_brightness);
@@ -253,13 +260,15 @@ void validate_model() {
     
     Serial.print(F("Test "));
     Serial.print(i + 1);
-    Serial.print(F(": Hour="));
+    Serial.print(F(": "));
+    Serial.print(day_names[tc.day_of_week]);
+    Serial.print(F(" "));
     Serial.print(tc.hour);
-    Serial.print(F(" Expected="));
+    Serial.print(F("h Exp="));
     Serial.print(tc.expected_brightness, 2);
-    Serial.print(F("% Predicted="));
+    Serial.print(F("% Pred="));
     Serial.print(predicted, 2);
-    Serial.print(F("% Error="));
+    Serial.print(F("% Err="));
     Serial.print(error, 4);
     Serial.println(error < 0.1 ? F(" PASS") : F(" FAIL"));
   }

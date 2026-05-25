@@ -26,7 +26,7 @@ class LEDBrightnessController:
             model_path (str): Path to pre-trained model file
         """
         self.model = None
-        self.feature_columns = ['ambient_light', 'motion_detected', 'sin_hour', 'cos_hour', 'time_period']
+        self.feature_columns = ['ambient_light', 'motion_detected', 'sin_hour', 'cos_hour', 'time_period', 'day_of_week']
         self.manual_offset = 0  # Range: -100 to +100
         
         if model_path:
@@ -35,7 +35,7 @@ class LEDBrightnessController:
     def augment_data(self, df):
         """
         Augment dataset with synthetic data for missing scenarios
-        Specifically: Night time + High ambient light -> Low LED brightness
+        Specifically: Night time + High ambient light -> Motion-dependent brightness
         
         Args:
             df (pd.DataFrame): Original dataset
@@ -48,30 +48,41 @@ class LEDBrightnessController:
         # Create synthetic data for night + high ambient light scenario
         synthetic_samples = []
         
-        # Night time period code (you'll need to adjust based on your encoding)
-        # Assuming time_period is encoded: 0=Early Morning, 1=Morning, 2=Afternoon, 3=Evening, 4=Night
+        # Night time period code: 4
         night_period = 4
         
+        # Calculate ambient light threshold (75th percentile)
+        ambient_75th = df['ambient_light'].quantile(0.75)
+        
         # Generate synthetic samples
-        num_synthetic = int(len(df) * 0.1)  # 10% synthetic data
+        num_synthetic = int(len(df) * 0.15)  # 15% synthetic data
         
         for _ in range(num_synthetic):
             # Night hours: 20:01 - 4:00 (in 24h: 20-23 and 0-4)
             night_hour = np.random.choice(list(range(21, 24)) + list(range(0, 5)))
             
-            # High ambient light (assuming your LDR values range, adjust as needed)
-            high_ambient = np.random.uniform(500, 1000)  # Adjust range based on your LDR sensor
+            # High ambient light
+            high_ambient = np.random.uniform(ambient_75th, df['ambient_light'].max())
             
-            # Motion can be random
-            motion = np.random.choice([0, 1], p=[0.3, 0.7])  # More likely to have motion
+            # Motion detection (50/50 split for better coverage)
+            motion = np.random.choice([0, 1], p=[0.5, 0.5])
             
             # Calculate sin/cos for hour
             sin_hour = np.sin(2 * np.pi * night_hour / 24)
             cos_hour = np.cos(2 * np.pi * night_hour / 24)
             
-            # Low brightness for night + high ambient light
-            # Logic: If ambient light is already high at night, LED should be dim
-            led_brightness = np.random.uniform(0, 30)  # 0-30% brightness
+            # Day of week (random)
+            day_of_week = np.random.randint(0, 7)
+            
+            # CRITICAL LOGIC: Night + High Ambient Light
+            # - WITH motion: LED brightness changes based on need (20-50%)
+            # - WITHOUT motion: LED brightness reduced to minimum (0-10%)
+            if motion == 1:
+                # Motion detected: provide moderate brightness
+                led_brightness = np.random.uniform(20, 50)
+            else:
+                # No motion: reduce to minimum or stay minimal
+                led_brightness = np.random.uniform(0, 10)
             
             synthetic_samples.append({
                 'ambient_light': high_ambient,
@@ -79,6 +90,7 @@ class LEDBrightnessController:
                 'sin_hour': sin_hour,
                 'cos_hour': cos_hour,
                 'time_period': night_period,
+                'day_of_week': day_of_week,
                 'led_brightness': led_brightness,
                 'synthetic': True
             })
@@ -92,7 +104,7 @@ class LEDBrightnessController:
         # Combine original and synthetic data
         augmented_df = pd.concat([df, synthetic_df], ignore_index=True)
         
-        print(f"Added {num_synthetic} synthetic samples")
+        print(f"Added {num_synthetic} synthetic samples for night + high ambient scenarios")
         print(f"Total samples: {len(augmented_df)}")
         
         return augmented_df
@@ -188,7 +200,7 @@ class LEDBrightnessController:
         
         return metrics
     
-    def predict(self, ambient_light, motion_detected, sin_hour, cos_hour, time_period):
+    def predict(self, ambient_light, motion_detected, sin_hour, cos_hour, time_period, day_of_week):
         """
         Predict LED brightness with manual override
         
@@ -198,6 +210,7 @@ class LEDBrightnessController:
             sin_hour (float): Sin component of hour
             cos_hour (float): Cos component of hour
             time_period (int): Time period code (0-4)
+            day_of_week (int): Day of week (0=Monday, 6=Sunday)
             
         Returns:
             dict: Prediction results with override
@@ -211,7 +224,8 @@ class LEDBrightnessController:
             'motion_detected': motion_detected,
             'sin_hour': sin_hour,
             'cos_hour': cos_hour,
-            'time_period': time_period
+            'time_period': time_period,
+            'day_of_week': day_of_week
         }])
         
         # ML prediction
@@ -275,15 +289,16 @@ class LEDBrightnessController:
         print(f"Model loaded from {filepath}")
 
 
-def calculate_time_features(hour):
+def calculate_time_features(hour, day_of_week=None):
     """
     Calculate sin/cos hour features and time period from hour
     
     Args:
         hour (int): Hour in 24h format (0-23)
+        day_of_week (int): Day of week (0=Monday, 6=Sunday), optional
         
     Returns:
-        tuple: (sin_hour, cos_hour, time_period)
+        tuple: (sin_hour, cos_hour, time_period, day_of_week)
     """
     sin_hour = np.sin(2 * np.pi * hour / 24)
     cos_hour = np.cos(2 * np.pi * hour / 24)
@@ -300,7 +315,11 @@ def calculate_time_features(hour):
     else:  # 20 < hour or hour < 4
         time_period = 4  # Night
     
-    return sin_hour, cos_hour, time_period
+    # If day_of_week not provided, return None
+    if day_of_week is None:
+        day_of_week = 0  # Default to Monday
+    
+    return sin_hour, cos_hour, time_period, day_of_week
 
 
 if __name__ == "__main__":

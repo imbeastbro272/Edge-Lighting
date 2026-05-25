@@ -170,12 +170,39 @@ void loop() {
 
 float readLDR() {
   // ESP32: 12-bit ADC (0-4095), 3.3V reference
-  int raw = analogRead(LDR_PIN);
-  float voltage = raw * (3.3 / 4095.0);
+  // LDR Calibration Constants
+  const float ADC_MAX = 4095.0;
+  const float VCC = 3.3;
+  const float R_FIXED = 10000.0;  // 10k fixed resistor
+  const float LDR_A = 32768000.0; // Calibration constant
+  const float LDR_B = -1.4;        // Calibration exponent
+  const int SAMPLES = 20;          // Number of samples for averaging
   
-  // Convert to approximate lux
-  // Calibrate this multiplier for your specific LDR
-  float lux = voltage * 300.0;  // Adjust multiplier based on your LDR
+  // Average multiple readings for stability
+  long sum = 0;
+  for (int i = 0; i < SAMPLES; i++) {
+    sum += analogRead(LDR_PIN);
+    delay(2);
+  }
+  float avg = sum / (float)SAMPLES;
+  
+  // Convert ADC to voltage
+  float voltage = (avg / ADC_MAX) * VCC;
+  
+  // Calculate LDR resistance using voltage divider formula
+  // V = VCC * R_LDR / (R_FIXED + R_LDR)
+  // Rearranged: R_LDR = R_FIXED * V / (VCC - V)
+  if (voltage <= 0.01) return 0.0;      // Avoid division by zero
+  if (voltage >= VCC)  return 100000.0; // Maximum brightness
+  
+  float r_ldr = R_FIXED * voltage / (VCC - voltage);
+  
+  // Convert resistance to lux using power law: Lux = A * R^B
+  float lux = LDR_A * pow(r_ldr, LDR_B);
+  
+  // Clamp to reasonable range
+  if (lux < 0) lux = 0;
+  if (lux > 100000) lux = 100000;
   
   return lux;
 }

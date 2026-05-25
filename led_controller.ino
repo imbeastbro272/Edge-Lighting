@@ -23,16 +23,16 @@
 #include "tree_rules.h"      // Generated ML model
 #include "test_cases.h"      // Validation tests
 
-// Pin definitions
-#define PIR_PIN 2
-#define LDR_PIN A0
-#define POT_PIN A1
-#define LED_PIN 9
+// Pin definitions (ESP32)
+#define PIR_PIN 27
+#define LDR_PIN 34
+#define POT_PIN 33
+#define LED_PIN 2
 
 // Configuration
 #define UPDATE_INTERVAL 1000  // Update every 1 second (ms)
 #define SMOOTHING_FACTOR 0.7  // For exponential moving average (0-1)
-#define POT_DEADZONE 20       // Deadzone around center (512 +/- 20)
+#define POT_DEADZONE 200      // Deadzone around center (2048 +/- 200) for ESP32
 
 // RTC
 RTC_DS3231 rtc;
@@ -90,9 +90,14 @@ void setup() {
   // Initialize smoothed values
   smoothed_ldr = readLDR();
   
-  Serial.println(F("\nStarting main loop...\n"));
-  Serial.println(F("Time\t\tHour\tAmbient\tMotion\tPeriod\tML%\tOffset\tFinal%\tPWM"));
-  Serial.println(F("--------\t----\t-------\t------\t------\t---\t------\t------\t---"));
+  Serial.println(F("\n=== Manual Time Setting ==="));
+  Serial.println(F("Type: settime HH:MM:SS (example: settime 14:30:00)"));
+  Serial.println(F("Type: help (for all commands)"));
+  
+  Serial.println(F("\n=== Starting Continuous Monitoring ===\n"));
+  Serial.println(F("┌──────────┬──────┬─────────┬────────┬────────┬──────┬────────┬────────┬─────┐"));
+  Serial.println(F("│   Time   │ Hour │ Ambient │ Motion │ Period │  ML% │ Offset │ Final% │ PWM │"));
+  Serial.println(F("├──────────┼──────┼─────────┼────────┼────────┼──────┼────────┼────────┼─────┤"));
 }
 
 void loop() {
@@ -146,27 +151,15 @@ void loop() {
     prediction_count++;
     avg_brightness = (avg_brightness * (prediction_count - 1) + final_brightness) / prediction_count;
     
-    // Output to serial (CSV format for easy logging)
+    // Output to serial (formatted table)
     char time_str[9];
     sprintf(time_str, "%02d:%02d:%02d", hour, minute, now.second());
     
-    Serial.print(time_str);
-    Serial.print(F("\t"));
-    Serial.print(hour);
-    Serial.print(F("\t"));
-    Serial.print(smoothed_ldr, 1);
-    Serial.print(F("\t"));
-    Serial.print(motion_detected);
-    Serial.print(F("\t"));
-    Serial.print(time_period);
-    Serial.print(F("\t"));
-    Serial.print(ml_brightness, 1);
-    Serial.print(F("\t"));
-    Serial.print(manual_offset);
-    Serial.print(F("\t"));
-    Serial.print(final_brightness, 1);
-    Serial.print(F("\t"));
-    Serial.println(pwm_value);
+    char line[100];
+    sprintf(line, "│ %s │  %2d  │ %6.1f  │   %d    │   %d    │ %4.1f │  %+4d  │ %5.1f  │ %3d │",
+            time_str, hour, smoothed_ldr, motion_detected, time_period, 
+            ml_brightness, manual_offset, final_brightness, pwm_value);
+    Serial.println(line);
   }
   
   // Check for serial commands
@@ -176,24 +169,23 @@ void loop() {
 }
 
 float readLDR() {
-  // Read LDR voltage (0-5V mapped to 0-1023)
+  // ESP32: 12-bit ADC (0-4095), 3.3V reference
   int raw = analogRead(LDR_PIN);
-  float voltage = raw * (5.0 / 1023.0);
+  float voltage = raw * (3.3 / 4095.0);
   
   // Convert to approximate lux
-  // This is a simplified conversion - calibrate for your specific LDR
-  // Typical relationship: Lux = 10^((V_ref - V_ldr) / sensitivity)
-  // For this example, using linear mapping
-  float lux = voltage * 200.0;  // Adjust multiplier based on your LDR
+  // Calibrate this multiplier for your specific LDR
+  float lux = voltage * 300.0;  // Adjust multiplier based on your LDR
   
   return lux;
 }
 
 int readManualOffset() {
+  // ESP32: 12-bit ADC (0-4095)
   int pot_value = analogRead(POT_PIN);
   
-  // Apply deadzone around center (512)
-  int center = 512;
+  // Center position for 12-bit ADC
+  int center = 2048;
   if (pot_value >= center - POT_DEADZONE && pot_value <= center + POT_DEADZONE) {
     return 0;  // No offset in deadzone
   }
@@ -205,7 +197,7 @@ int readManualOffset() {
     offset = map(pot_value, 0, center - POT_DEADZONE, -100, 0);
   } else {
     // Above center: map to 0 to +100
-    offset = map(pot_value, center + POT_DEADZONE, 1023, 0, 100);
+    offset = map(pot_value, center + POT_DEADZONE, 4095, 0, 100);
   }
   
   return offset;
@@ -301,13 +293,18 @@ void handleSerialCommand() {
       Serial.println(F("Example: settime 14:30:45"));
     }
   } else if (cmd == "help") {
-    Serial.println(F("\n=== Commands ==="));
-    Serial.println(F("stats          - Show statistics"));
-    Serial.println(F("time           - Show current time"));
-    Serial.println(F("settime HH:MM:SS - Set time manually (24-hour format)"));
-    Serial.println(F("                 Example: settime 14:30:45"));
-    Serial.println(F("test           - Re-run model validation"));
-    Serial.println(F("help           - Show this help"));
+    Serial.println(F("\n┌─────────────────────────────────────────────────────────────┐"));
+    Serial.println(F("│                      COMMAND HELP                           │"));
+    Serial.println(F("├─────────────────────────────────────────────────────────────┤"));
+    Serial.println(F("│ settime HH:MM:SS  - Set time manually (24-hour format)      │"));
+    Serial.println(F("│                     Example: settime 14:30:45               │"));
+    Serial.println(F("│                     Example: settime 22:15:00               │"));
+    Serial.println(F("│                                                             │"));
+    Serial.println(F("│ time              - Show current RTC time                   │"));
+    Serial.println(F("│ stats             - Show prediction statistics              │"));
+    Serial.println(F("│ test              - Re-run model validation                 │"));
+    Serial.println(F("│ help              - Show this help menu                     │"));
+    Serial.println(F("└─────────────────────────────────────────────────────────────┘"));
     Serial.println();
   } else if (cmd.length() > 0) {
     Serial.print(F("Unknown command: "));

@@ -271,12 +271,43 @@ void handleSerialCommand() {
   } else if (cmd == "test") {
     // Re-run validation
     validate_model();
+  } else if (cmd.startsWith("settime ")) {
+    // Set time manually: settime HH:MM:SS
+    // Example: settime 14:30:45
+    String timeStr = cmd.substring(8);
+    timeStr.trim();
+    
+    if (timeStr.length() == 8 && timeStr.charAt(2) == ':' && timeStr.charAt(5) == ':') {
+      int hour = timeStr.substring(0, 2).toInt();
+      int minute = timeStr.substring(3, 5).toInt();
+      int second = timeStr.substring(6, 8).toInt();
+      
+      if (hour >= 0 && hour < 24 && minute >= 0 && minute < 60 && second >= 0 && second < 60) {
+        DateTime now = rtc.now();
+        rtc.adjust(DateTime(now.year(), now.month(), now.day(), hour, minute, second));
+        Serial.print(F("Time set to: "));
+        Serial.print(hour);
+        Serial.print(F(":"));
+        Serial.print(minute);
+        Serial.print(F(":"));
+        Serial.println(second);
+      } else {
+        Serial.println(F("Error: Invalid time values"));
+        Serial.println(F("Format: settime HH:MM:SS (24-hour format)"));
+      }
+    } else {
+      Serial.println(F("Error: Invalid time format"));
+      Serial.println(F("Format: settime HH:MM:SS"));
+      Serial.println(F("Example: settime 14:30:45"));
+    }
   } else if (cmd == "help") {
     Serial.println(F("\n=== Commands ==="));
-    Serial.println(F("stats  - Show statistics"));
-    Serial.println(F("time   - Show current time"));
-    Serial.println(F("test   - Re-run model validation"));
-    Serial.println(F("help   - Show this help"));
+    Serial.println(F("stats          - Show statistics"));
+    Serial.println(F("time           - Show current time"));
+    Serial.println(F("settime HH:MM:SS - Set time manually (24-hour format)"));
+    Serial.println(F("                 Example: settime 14:30:45"));
+    Serial.println(F("test           - Re-run model validation"));
+    Serial.println(F("help           - Show this help"));
     Serial.println();
   } else if (cmd.length() > 0) {
     Serial.print(F("Unknown command: "));

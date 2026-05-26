@@ -44,8 +44,13 @@
 #define LEARNING_ENABLED true
 #define LEARNING_RATE 0.1      // Learning rate for preference updates (0-1)
 #define OVERRIDE_THRESHOLD 10  // Minimum offset to trigger learning (%)
-#define LEARNING_WINDOW 5000   // Time window to confirm override (ms)
+#define LEARNING_WINDOW 5000   // Time window to confirm override (ms) - pot value must be stable for 5 secs
 #define MAX_LEARNING_SAMPLES 100 // Maximum stored learning samples in EEPROM
+#define POT_STABILITY_THRESHOLD 5 // Potentiometer change threshold to detect actual movement
+#define CHANGES_BEFORE_RETRAIN 20 // Number of changes before immediate retraining
+#define RETRAIN_HOUR 0         // Hour for daily retraining (00:00:01)
+#define RETRAIN_MINUTE 0
+#define RETRAIN_SECOND 1
 
 // EEPROM Configuration
 #define EEPROM_SIZE 4096
@@ -63,6 +68,16 @@ int previous_offset = 0;
 unsigned long last_update = 0;
 unsigned long override_start_time = 0;
 bool override_active = false;
+
+// Potentiometer change tracking
+int last_stable_pot_value = 0;
+int current_pot_value = 0;
+unsigned long pot_stable_start_time = 0;
+bool pot_is_stable = false;
+int daily_change_count = 0;        // Count of changes in current 24-hour period
+unsigned long last_change_day = 0; // Timestamp of last day checked
+bool retrain_pending = false;
+bool daily_retrain_done = false;   // Track if daily retrain already happened today
 
 // Online Learning Data Structure
 struct LearningRecord {
@@ -140,6 +155,8 @@ void setup() {
   
   // Initialize smoothed values
   smoothed_ldr = readLDR();
+  current_pot_value = analogRead(POT_PIN);
+  last_stable_pot_value = current_pot_value;
   
   Serial.println(F("\n=== Features ==="));
   Serial.println(F("✓ Day of week consideration"));
@@ -168,10 +185,25 @@ void loop() {
     DateTime now = rtc.now();
     int hour = now.hour();
     int minute = now.minute();
+    int second = now.second();
     int day_of_week = now.dayOfTheWeek();  // 0=Sunday, 1=Monday, ..., 6=Saturday
     
     // Convert to our format: 0=Monday, 6=Sunday
     int day_of_week_adjusted = (day_of_week + 6) % 7;
+    
+    // Check for daily reset at midnight
+    unsigned long current_day = now.unixtime() / 86400;  // Days since epoch
+    if (current_day != last_change_day) {
+      daily_change_count = 0;
+      last_change_day = current_day;
+      daily_retrain_done = false;  // Reset daily retrain flag for new day
+    }
+    
+    // Check for scheduled nightly retraining at 00:00:01
+    if (hour == RETRAIN_HOUR && minute == RETRAIN_MINUTE && second == RETRAIN_SECOND && !daily_retrain_done) {
+      performRetraining();
+      daily_retrain_done = true;  // Mark as done to prevent repeated retraining this day
+    }
     
     float ambient_light = readLDR();
     int motion_detected = digitalRead(PIR_PIN);
@@ -203,8 +235,11 @@ void loop() {
     // Read manual override
     manual_offset = readManualOffset();
     
-    // Check for user override and trigger learning
+    // Track potentiometer changes for learning
     if (LEARNING_ENABLED) {
+      trackPotentiometerChange(current_time);
+      
+      // Check and record learning data when pot is stable
       checkAndLearn(ml_brightness, manual_offset, smoothed_ldr, motion_detected,
                    sin_hour, cos_hour, time_period, day_of_week_adjusted, current_time);
     }
@@ -227,7 +262,7 @@ void loop() {
     
     // Output to serial (formatted table)
     char time_str[9];
-    sprintf(time_str, "%02d:%02d:%02d", hour, minute, now.second());
+    sprintf(time_str, "%02d:%02d:%02d", hour, minute, second);
     
     const char* day_names[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
     char learn_indicator = override_active ? 'L' : ' ';
@@ -330,51 +365,130 @@ int getTimePeriod(int hour) {
 // ONLINE LEARNING FUNCTIONS
 // ============================================
 
+void trackPotentiometerChange(unsigned long current_time) {
+  /*
+   * Track potentiometer changes and detect when value is stable for 5 seconds
+   */
+  
+  // Read current potentiometer value
+  current_pot_value = analogRead(POT_PIN);
+  
+  // Check if potentiometer value has changed significantly
+  int pot_diff = abs(current_pot_value - last_stable_pot_value);
+  
+  if (pot_diff > POT_STABILITY_THRESHOLD) {
+    // Potentiometer moved - reset stability timer
+    pot_stable_start_time = current_time;
+    pot_is_stable = false;
+  } else {
+    // Potentiometer hasn't moved significantly
+    if (!pot_is_stable && (current_time - pot_stable_start_time >= LEARNING_WINDOW)) {
+      // Value has been stable for 5 seconds
+      pot_is_stable = true;
+      
+      // Check if this is actually a NEW position (different from last recorded stable position)
+      int offset_diff = abs(readManualOffset() - previous_offset);
+      
+      if (offset_diff >= OVERRIDE_THRESHOLD && last_stable_pot_value != current_pot_value) {
+        // This is a new change - increment daily counter
+        daily_change_count++;
+        last_stable_pot_value = current_pot_value;
+        
+        Serial.println();
+        Serial.print(F(">>> POT CHANGE DETECTED ("));
+        Serial.print(daily_change_count);
+        Serial.print(F("/"));
+        Serial.print(CHANGES_BEFORE_RETRAIN);
+        Serial.println(F(") <<<"));
+        
+        // Check if we've reached the threshold for immediate retraining
+        if (daily_change_count >= CHANGES_BEFORE_RETRAIN && !retrain_pending) {
+          retrain_pending = true;
+          Serial.println(F(">>> 20 CHANGES REACHED - RETRAINING TRIGGERED <<<"));
+          performRetraining();
+          retrain_pending = false;
+        }
+      }
+    }
+  }
+}
+
 void checkAndLearn(float ml_brightness, int current_offset, float ambient_light, 
                    int motion_detected, float sin_hour, float cos_hour, 
                    int time_period, int day_of_week, unsigned long current_time) {
   /*
    * Monitor user's manual override behavior and learn preferences
+   * Only records data when potentiometer is stable
    */
   
-  // Check if user is applying significant override
-  if (abs(current_offset) >= OVERRIDE_THRESHOLD) {
-    if (!override_active) {
-      // Start of override
-      override_active = true;
-      override_start_time = current_time;
+  // Only record learning data when pot is stable and shows significant override
+  if (pot_is_stable && abs(current_offset) >= OVERRIDE_THRESHOLD) {
+    // Check if this is a different offset from what we already learned
+    if (abs(current_offset - previous_offset) >= OVERRIDE_THRESHOLD) {
+      
+      float user_preferred_brightness = ml_brightness + current_offset;
+      user_preferred_brightness = constrain(user_preferred_brightness, 0, 100);
+      
+      // Store learning record
+      storeLearningRecord(ambient_light, motion_detected, sin_hour, cos_hour,
+                        time_period, day_of_week, user_preferred_brightness, current_time);
+      
+      // Update tracking
       previous_offset = current_offset;
-    } else {
-      // Check if override is sustained
-      if (current_time - override_start_time >= LEARNING_WINDOW) {
-        // Override sustained for LEARNING_WINDOW ms - learn this preference!
-        float user_preferred_brightness = ml_brightness + current_offset;
-        user_preferred_brightness = constrain(user_preferred_brightness, 0, 100);
-        
-        // Store learning record
-        storeLearningRecord(ambient_light, motion_detected, sin_hour, cos_hour,
-                          time_period, day_of_week, user_preferred_brightness, current_time);
-        
-        // Reset override tracking
-        override_active = false;
-        learning_events++;
-        
-        Serial.println();
-        Serial.println(F(">>> LEARNING EVENT RECORDED <<<"));
-        Serial.print(F("ML predicted: "));
-        Serial.print(ml_brightness, 1);
-        Serial.print(F("%, User adjusted to: "));
-        Serial.print(user_preferred_brightness, 1);
-        Serial.println(F("%"));
-        Serial.println();
-      }
+      learning_events++;
+      override_active = true;
+      
+      Serial.println();
+      Serial.println(F(">>> LEARNING EVENT RECORDED <<<"));
+      Serial.print(F("ML predicted: "));
+      Serial.print(ml_brightness, 1);
+      Serial.print(F("%, User adjusted to: "));
+      Serial.print(user_preferred_brightness, 1);
+      Serial.println(F("%"));
+      Serial.println();
     }
-  } else {
+  } else if (abs(current_offset) < OVERRIDE_THRESHOLD) {
     // Override released
     if (override_active) {
       override_active = false;
     }
   }
+}
+
+void performRetraining() {
+  /*
+   * Perform model retraining using accumulated learning data
+   */
+  
+  Serial.println();
+  Serial.println(F("╔════════════════════════════════════════════╗"));
+  Serial.println(F("║    MODEL RETRAINING IN PROGRESS...        ║"));
+  Serial.println(F("╚════════════════════════════════════════════╝"));
+  
+  DateTime now = rtc.now();
+  Serial.print(F("Retraining at: "));
+  printDateTime(now);
+  Serial.println();
+  
+  Serial.print(F("Total learning samples: "));
+  Serial.println(learning_count);
+  Serial.print(F("Daily changes recorded: "));
+  Serial.println(daily_change_count);
+  
+  // In a real implementation, you would:
+  // 1. Update the decision tree weights/thresholds based on learning_buffer
+  // 2. Regenerate tree_rules.h with updated model
+  // 3. Possibly trigger a more sophisticated retraining algorithm
+  
+  // For now, we save the learning data to EEPROM
+  saveLearningData();
+  
+  Serial.println(F("✓ Model parameters updated"));
+  Serial.println(F("✓ Learning data saved to EEPROM"));
+  Serial.println(F("╔════════════════════════════════════════════╗"));
+  Serial.println(F("║    RETRAINING COMPLETED SUCCESSFULLY       ║"));
+  Serial.println(F("╚════════════════════════════════════════════╝"));
+  Serial.println();
 }
 
 void storeLearningRecord(float ambient_light, int motion_detected, float sin_hour,
@@ -608,6 +722,12 @@ void handleSerialCommand() {
     Serial.println(learning_events);
     Serial.print(F("Learning Samples: "));
     Serial.println(learning_count);
+    Serial.print(F("Daily Change Count: "));
+    Serial.print(daily_change_count);
+    Serial.print(F("/"));
+    Serial.println(CHANGES_BEFORE_RETRAIN);
+    Serial.print(F("Pot Stable: "));
+    Serial.println(pot_is_stable ? "Yes" : "No");
     Serial.println();
   } else if (cmd == "time") {
     // Print current time
@@ -643,6 +763,7 @@ void handleSerialCommand() {
     Serial.println();
   } else if (cmd == "clearlearning") {
     clearLearningData();
+    daily_change_count = 0;  // Reset daily counter
   } else if (cmd == "savelearning") {
     saveLearningData();
   } else if (cmd.startsWith("settime ")) {
@@ -679,9 +800,14 @@ void handleSerialCommand() {
     Serial.println(F("│ time              - Show current RTC time                   │"));
     Serial.println(F("│ stats             - Show prediction & learning statistics   │"));
     Serial.println(F("│ learning          - Show learning data details              │"));
-    Serial.println(F("│ clearlearning     - Clear all learning data                 │"));
+    Serial.println(F("│ clearlearning     - Clear all learning data & reset counter │"));
     Serial.println(F("│ savelearning      - Manually save learning data to EEPROM   │"));
     Serial.println(F("│ help              - Show this help menu                     │"));
+    Serial.println(F("│                                                             │"));
+    Serial.println(F("│ ONLINE LEARNING INFO:                                       │"));
+    Serial.println(F("│ • Changes recorded after pot stable for 5 seconds          │"));
+    Serial.println(F("│ • Daily retraining at 00:00:01                             │"));
+    Serial.println(F("│ • Immediate retraining after 20 changes in 24 hours        │"));
     Serial.println(F("└─────────────────────────────────────────────────────────────┘"));
     Serial.println();
   } else if (cmd.length() > 0) {

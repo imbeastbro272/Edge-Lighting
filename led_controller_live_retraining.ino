@@ -697,19 +697,192 @@ void checkScheduledRetraining(DateTime &now) {
 // SERIAL COMMANDS
 // ============================================
 
+// ============================================
+// MANUAL TESTING & VERIFICATION
+// ============================================
+
+void testManualPrediction(int hour, int day, float ambient, 
+                          int motion, int pot_value) {
+  
+  float sin_hour = sin(2.0 * PI * hour / 24.0);
+  float cos_hour = cos(2.0 * PI * hour / 24.0);
+  int time_period = getTimePeriod(hour);
+  
+  // Calculate offset from pot value
+  int center = 2048;
+  int offset = 0;
+  
+  if (pot_value >= center - POT_DEADZONE &&
+      pot_value <= center + POT_DEADZONE) {
+    offset = 0;
+  }
+  else if (pot_value < center - POT_DEADZONE) {
+    offset = map(pot_value, 0, center - POT_DEADZONE, -100, 0);
+  }
+  else {
+    offset = map(pot_value, center + POT_DEADZONE, 4095, 0, 100);
+  }
+  
+  // Get predictions from both models
+  float tree_pred = predict_brightness(
+    ambient, motion, sin_hour, cos_hour, time_period, day
+  );
+  
+  float adaptive_pred = predictAdaptive(
+    ambient, motion, sin_hour, cos_hour, time_period, day
+  );
+  
+  // Calculate final brightness
+  float tree_final = constrain(tree_pred + offset, 0, 100);
+  float adaptive_final = constrain(adaptive_pred + offset, 0, 100);
+  
+  // Display results
+  Serial.println(F(""));
+  Serial.println(F("╔════════════════════════════════════════════╗"));
+  Serial.println(F("║     MANUAL PREDICTION TEST RESULTS         ║"));
+  Serial.println(F("╚════════════════════════════════════════════╝"));
+  
+  const char* day_names[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+  const char* period_names[] = {"Early Morning", "Morning", "Afternoon", "Evening", "Night"};
+  
+  Serial.print(F("📍 Input Parameters:\n"));
+  Serial.print(F("   Time: "));
+  Serial.print(hour);
+  Serial.print(F(":00 ("));
+  Serial.print(period_names[time_period]);
+  Serial.println(F(")"));
+  Serial.print(F("   Day: "));
+  Serial.println(day_names[day]);
+  Serial.print(F("   Ambient Light: "));
+  Serial.print(ambient);
+  Serial.println(F(" lux"));
+  Serial.print(F("   Motion: "));
+  Serial.println(motion ? F("YES") : F("NO"));
+  Serial.print(F("   Pot Value: "));
+  Serial.print(pot_value);
+  Serial.print(F(" (Offset: "));
+  Serial.print(offset);
+  Serial.println(F("%)"));
+  
+  Serial.println(F(""));
+  Serial.println(F("📊 Model Predictions:"));
+  Serial.println(F("┌─────────────────┬──────────┬──────────┬──────────┐"));
+  Serial.println(F("│ Model           │ Raw (%)  │ Offset   │ Final(%) │"));
+  Serial.println(F("├─────────────────┼──────────┼──────────┼──────────┤"));
+  
+  // Tree model
+  char tree_line[60];
+  sprintf(tree_line, "│ TREE (Original) │ %7.2f │ %+7d │ %7.2f │",
+          tree_pred, offset, tree_final);
+  Serial.println(tree_line);
+  
+  // Adaptive model
+  char adaptive_line[60];
+  sprintf(adaptive_line, "│ ADAPTIVE(Learn) │ %7.2f │ %+7d │ %7.2f │",
+          adaptive_pred, offset, adaptive_final);
+  Serial.println(adaptive_line);
+  
+  Serial.println(F("└─────────────────┴──────────┴──────────┴──────────┘"));
+  
+  // Calculate difference
+  float diff = adaptive_pred - tree_pred;
+  float diff_pct = (diff / tree_pred) * 100;
+  
+  Serial.println(F(""));
+  Serial.println(F("📈 Model Comparison:"));
+  Serial.print(F("   Difference: "));
+  Serial.print(diff);
+  Serial.print(F("% ("));
+  Serial.print(diff_pct);
+  Serial.println(F("% change)"));
+  Serial.print(F("   Active Model: "));
+  Serial.println(use_adaptive_model ? F("ADAPTIVE (Learned)") : F("TREE (Original)"));
+  
+  if (use_adaptive_model) {
+    Serial.println(F("   ✓ Using learned model for real control"));
+  } else {
+    Serial.println(F("   ✓ Using original tree (adaptive model available)"));
+  }
+  
+  Serial.println(F(""));
+}
+
+void displayModelWeights() {
+  Serial.println(F(""));
+  Serial.println(F("╔════════════════════════════════════════════╗"));
+  Serial.println(F("║    DETAILED MODEL WEIGHTS (LEARNED)        ║"));
+  Serial.println(F("╚════════════════════════════════════════════╝"));
+  
+  Serial.print(F("Bias: "));
+  Serial.println(adaptive_model.bias, 3);
+  
+  Serial.println(F(""));
+  Serial.println(F("Feature Weights:"));
+  Serial.print(F("  Ambient Light: "));
+  Serial.println(adaptive_model.ambient_weight, 6);
+  Serial.print(F("  Motion: "));
+  Serial.println(adaptive_model.motion_weight, 3);
+  Serial.print(F("  Sin(Hour): "));
+  Serial.println(adaptive_model.sin_hour_weight, 3);
+  Serial.print(F("  Cos(Hour): "));
+  Serial.println(adaptive_model.cos_hour_weight, 3);
+  
+  Serial.println(F(""));
+  Serial.println(F("Time Period Weights:"));
+  const char* periods[] = {"Early Morning", "Morning", "Afternoon", "Evening", "Night"};
+  for (int i = 0; i < 5; i++) {
+    Serial.print(F("  "));
+    Serial.print(periods[i]);
+    Serial.print(F(": "));
+    Serial.println(adaptive_model.time_period_weights[i], 3);
+  }
+  
+  Serial.println(F(""));
+  Serial.println(F("Day of Week Weights:"));
+  const char* days[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+  for (int i = 0; i < 7; i++) {
+    Serial.print(F("  "));
+    Serial.print(days[i]);
+    Serial.print(F(": "));
+    Serial.println(adaptive_model.day_of_week_weights[i], 3);
+  }
+  
+  Serial.println(F(""));
+  Serial.print(F("Learning Rate: "));
+  Serial.println(adaptive_model.learning_rate, 6);
+  Serial.print(F("Total Updates: "));
+  Serial.println(adaptive_model.update_count);
+  Serial.println(F(""));
+}
+
 void handleSerialCommand() {
   String command = Serial.readStringUntil('\n');
   command.trim();
   
   if (command == "help") {
-    Serial.println(F("=== COMMANDS ==="));
-    Serial.println(F("help - Show commands"));
-    Serial.println(F("stats - Show statistics"));
-    Serial.println(F("retrain - Force retraining"));
-    Serial.println(F("samples - View training samples"));
-    Serial.println(F("clearsamples - Clear all samples"));
-    Serial.println(F("resetmodel - Reset to initial model"));
-    Serial.println(F("modelinfo - Show model details"));
+    Serial.println(F("=== BASIC COMMANDS ==="));
+    Serial.println(F("help          - Show all commands"));
+    Serial.println(F("stats         - Show statistics"));
+    Serial.println(F("retrain       - Force retraining"));
+    Serial.println(F(""));
+    Serial.println(F("=== SAMPLE MANAGEMENT ==="));
+    Serial.println(F("samples       - View training samples"));
+    Serial.println(F("clearsamples  - Clear all samples"));
+    Serial.println(F("");
+    Serial.println(F("=== MODEL INSPECTION ==="));
+    Serial.println(F("modelinfo     - Show model summary"));
+    Serial.println(F("weights       - Show detailed weights"));
+    Serial.println(F("");
+    Serial.println(F("=== MANUAL TESTING ==="));
+    Serial.println(F("test HH DD AMBIENT MOTION POT"));
+    Serial.println(F("  HH: Hour (0-23)"));
+    Serial.println(F("  DD: Day (0=Mon, 1=Tue, ..., 6=Sun)"));
+    Serial.println(F("  AMBIENT: Light level in lux (0-10000)"));
+    Serial.println(F("  MOTION: 0=No, 1=Yes"));
+    Serial.println(F("  POT: Pot value (0-4095, 2048=center)"));
+    Serial.println(F("");
+    Serial.println(F("Example: test 22 1 300 1 2200");
+    Serial.println(F("         (10 PM, Tuesday, 300 lux, motion, pot=2200)");
   }
   else if (command == "stats") {
     Serial.println(F("=== STATISTICS ==="));
@@ -729,18 +902,30 @@ void handleSerialCommand() {
   }
   else if (command == "samples") {
     Serial.println(F("=== TRAINING SAMPLES ==="));
+    if (training_sample_count == 0) {
+      Serial.println(F("No samples collected yet"));
+      return;
+    }
+    Serial.print(F("Total Samples: "));
+    Serial.println(training_sample_count);
+    Serial.println(F(""));
+    Serial.println(F("┌────┬─────────┬────────┬──────────┬─────────┬──────────┬─────────────┐"));
+    Serial.println(F("│ # │Ambient  │Motion  │ Period   │ Day    │ Target%  │  Timestamp  │"));
+    Serial.println(F("├────┼─────────┼────────┼──────────┼─────────┼──────────┼─────────────┤"));
+    
     for (int i = 0; i < training_sample_count; i++) {
       TrainingSample s = loadTrainingSample(i);
-      Serial.print(F("Sample "));
-      Serial.print(i + 1);
-      Serial.print(F(": Ambient="));
-      Serial.print(s.ambient_light);
-      Serial.print(F(" Motion="));
-      Serial.print(s.motion_detected);
-      Serial.print(F(" Target="));
-      Serial.print(s.target_brightness);
-      Serial.println(F("%"));
+      const char* day_names[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+      const char* period_names[] = {"E.Morn", "Morn", "Aftern", "Even", "Night"};
+      
+      char line[100];
+      sprintf(line, "│%2d │%7.1f │   %d    │ %6s   │  %3s  │  %6.1f │ %ld │",
+              i + 1, s.ambient_light, s.motion_detected, 
+              period_names[s.time_period], day_names[s.day_of_week],
+              s.target_brightness, s.timestamp);
+      Serial.println(line);
     }
+    Serial.println(F("└────┴─────────┴────────┴──────────┴─────────┴──────────┴─────────────┘"));
   }
   else if (command == "clearsamples") {
     training_sample_count = 0;
@@ -751,22 +936,64 @@ void handleSerialCommand() {
   else if (command == "resetmodel") {
     initializeAdaptiveModel();
     saveAdaptiveModel();
+    use_adaptive_model = false;
     Serial.println(F("✓ Model reset to defaults"));
+    Serial.println(F("  Switched back to TREE model"));
   }
   else if (command == "modelinfo") {
     Serial.println(F("=== MODEL INFO ==="));
     Serial.print(F("Type: "));
-    Serial.println(use_adaptive_model ? F("ADAPTIVE") : F("TREE"));
+    Serial.println(use_adaptive_model ? F("ADAPTIVE (Learned)") : F("TREE (Original)"));
     Serial.print(F("Update Count: "));
     Serial.println(adaptive_model.update_count);
     Serial.print(F("Learning Rate: "));
-    Serial.println(adaptive_model.learning_rate, 4);
+    Serial.println(adaptive_model.learning_rate, 6);
     Serial.print(F("Bias: "));
     Serial.println(adaptive_model.bias, 2);
+  }
+  else if (command == "weights") {
+    displayModelWeights();
+  }
+  else if (command.startsWith("test ")) {
+    int hour, day, motion, pot;
+    float ambient;
+    
+    int parsed = sscanf(command.c_str(), "test %d %d %f %d %d",
+                       &hour, &day, &ambient, &motion, &pot);
+    
+    if (parsed == 5) {
+      // Validate inputs
+      if (hour < 0 || hour > 23) {
+        Serial.println(F("❌ Error: Hour must be 0-23"));
+        return;
+      }
+      if (day < 0 || day > 6) {
+        Serial.println(F("❌ Error: Day must be 0-6 (0=Mon, 6=Sun)"));
+        return;
+      }
+      if (ambient < 0 || ambient > 100000) {
+        Serial.println(F("❌ Error: Ambient must be 0-100000 lux"));
+        return;
+      }
+      if (motion != 0 && motion != 1) {
+        Serial.println(F("❌ Error: Motion must be 0 or 1"));
+        return;
+      }
+      if (pot < 0 || pot > 4095) {
+        Serial.println(F("❌ Error: Pot must be 0-4095"));
+        return;
+      }
+      
+      testManualPrediction(hour, day, ambient, motion, pot);
+    } else {
+      Serial.println(F("❌ Invalid format. Use: test HH DD AMBIENT MOTION POT"));
+      Serial.println(F("   Example: test 22 1 300 1 2200"));
+    }
   }
   else {
     Serial.print(F("Unknown command: "));
     Serial.println(command);
+    Serial.println(F("Type 'help' for available commands"));
   }
 }
 

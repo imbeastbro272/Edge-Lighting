@@ -47,6 +47,14 @@
 #define LEARNING_WINDOW 5000   // Time window to confirm override (ms)
 #define MAX_LEARNING_SAMPLES 100 // Maximum stored learning samples in EEPROM
 
+// Potentiometer-based Retraining Configuration
+#define POT_STABLE_DURATION 5000   // Pot value must remain same for 5 seconds (ms)
+#define POT_CHANGE_THRESHOLD 50    // Minimum ADC change to consider pot value "changed"
+#define MAX_CHANGES_BEFORE_RETRAIN 20  // Trigger immediate retraining after 20 changes
+#define RETRAIN_HOUR 0             // Midnight retraining hour
+#define RETRAIN_MINUTE 0           // Midnight retraining minute
+#define RETRAIN_SECOND 1           // Midnight retraining second (00:00:01)
+
 // EEPROM Configuration
 #define EEPROM_SIZE 4096
 #define EEPROM_MAGIC 0xA5B3    // Magic number to validate EEPROM data
@@ -63,6 +71,18 @@ int previous_offset = 0;
 unsigned long last_update = 0;
 unsigned long override_start_time = 0;
 bool override_active = false;
+
+// Potentiometer retraining state variables
+int last_stable_pot_value = -1;       // Last confirmed stable pot value (-1 = not set)
+int current_pot_candidate = -1;       // Current pot value being monitored for stability
+unsigned long pot_stable_start = 0;   // When current candidate pot value started being stable
+bool pot_candidate_active = false;    // Whether we are currently monitoring a candidate
+
+// Retraining schedule state
+int pot_change_count_today = 0;       // Number of pot changes recorded today
+bool retrained_at_midnight = false;   // Flag to avoid multiple midnight retrains
+bool retrained_at_20_changes = false; // Flag to avoid repeated 20-change retrains
+int last_retrain_day = -1;            // Day of month when last daily reset occurred
 
 // Online Learning Data Structure
 struct LearningRecord {
@@ -81,6 +101,25 @@ struct LearningRecord {
 LearningRecord learning_buffer[10];  // Ring buffer for recent overrides
 int learning_buffer_index = 0;
 int learning_count = 0;
+
+// Potentiometer Retraining Data Structure
+struct PotChangeRecord {
+  float ambient_light;
+  int motion_detected;
+  float sin_hour;
+  float cos_hour;
+  int time_period;
+  int day_of_week;
+  int pot_value;             // Raw ADC pot value at the time of change
+  float final_brightness;    // The resulting brightness user set via pot
+  unsigned long timestamp;
+  bool valid;
+};
+
+// Potentiometer change buffer (stores up to 50 changes per day)
+#define MAX_POT_CHANGES_BUFFER 50
+PotChangeRecord pot_change_buffer[MAX_POT_CHANGES_BUFFER];
+int pot_change_buffer_index = 0;
 
 // EEPROM Learning Storage Header
 struct EEPROMHeader {
@@ -146,6 +185,9 @@ void setup() {
   Serial.println(F("✓ Night + High Ambient Light scenario handling"));
   Serial.println(F("✓ Online learning from user preferences"));
   Serial.println(F("✓ EEPROM persistence across reboots"));
+  Serial.println(F("✓ Pot-based retraining (5s stable = change recorded)"));
+  Serial.println(F("✓ Scheduled retraining at 00:00:01 daily"));
+  Serial.println(F("✓ Immediate retraining after 20 pot changes/day"));
   
   Serial.println(F("\n=== Manual Time Setting ==="));
   Serial.println(F("Type: settime HH:MM:SS (example: settime 14:30:00)"));
@@ -237,6 +279,13 @@ void loop() {
             time_str, day_names[day_of_week_adjusted], hour, smoothed_ldr, motion_detected, 
             time_period, ml_brightness, manual_offset, final_brightness, pwm_value, learn_indicator);
     Serial.println(line);
+    
+    // === Potentiometer-based retraining logic ===
+    monitorPotForRetraining(now, smoothed_ldr, motion_detected, sin_hour, cos_hour, 
+                            time_period, day_of_week_adjusted, final_brightness, current_time);
+    
+    // === Scheduled retraining checks ===
+    checkScheduledRetraining(now);
   }
   
   // Check for serial commands
@@ -567,6 +616,212 @@ void clearLearningData() {
 }
 
 // ============================================
+// POTENTIOMETER-BASED RETRAINING FUNCTIONS
+// ============================================
+
+void monitorPotForRetraining(DateTime &now, float ambient_light, int motion_detected,
+                             float sin_hour, float cos_hour, int time_period,
+                             int day_of_week, float final_brightness, unsigned long current_time) {
+  /*
+   * Monitor potentiometer value for stable changes.
+   * A change is recorded only when:
+   *   1. The pot value differs from the last stable value
+   *   2. The new value remains stable (unchanged) for 5 seconds
+   */
+  
+  int current_pot_raw = analogRead(POT_PIN);
+  
+  // Check if pot value has changed from what we're currently tracking as candidate
+  if (pot_candidate_active) {
+    // Check if current reading is still close to the candidate value
+    if (abs(current_pot_raw - current_pot_candidate) <= POT_CHANGE_THRESHOLD) {
+      // Still stable at candidate value - check if 5 seconds elapsed
+      if (current_time - pot_stable_start >= POT_STABLE_DURATION) {
+        // Pot has been stable for 5 seconds!
+        // Check if it's actually different from last confirmed stable value
+        if (last_stable_pot_value == -1 || abs(current_pot_raw - last_stable_pot_value) > POT_CHANGE_THRESHOLD) {
+          // This is a confirmed new pot change - record it
+          recordPotChange(ambient_light, motion_detected, sin_hour, cos_hour,
+                         time_period, day_of_week, current_pot_raw, final_brightness, current_time);
+          
+          last_stable_pot_value = current_pot_raw;
+          pot_candidate_active = false;
+          
+          // Check if we hit 20 changes threshold
+          if (pot_change_count_today >= MAX_CHANGES_BEFORE_RETRAIN && !retrained_at_20_changes) {
+            Serial.println();
+            Serial.println(F(">>> 20 POT CHANGES REACHED - TRIGGERING IMMEDIATE RETRAINING <<<"));
+            performRetraining();
+            retrained_at_20_changes = true;
+          }
+        } else {
+          // Pot returned to same value as before - not a real change
+          pot_candidate_active = false;
+        }
+      }
+      // else: still waiting for 5 seconds to elapse, do nothing
+    } else {
+      // Pot value changed again while we were monitoring - restart stability timer
+      current_pot_candidate = current_pot_raw;
+      pot_stable_start = current_time;
+    }
+  } else {
+    // No candidate active - check if pot moved away from last stable value
+    if (last_stable_pot_value == -1) {
+      // First time - set initial stable value
+      last_stable_pot_value = current_pot_raw;
+    } else if (abs(current_pot_raw - last_stable_pot_value) > POT_CHANGE_THRESHOLD) {
+      // Pot value has changed from last stable - start monitoring candidate
+      pot_candidate_active = true;
+      current_pot_candidate = current_pot_raw;
+      pot_stable_start = current_time;
+    }
+  }
+}
+
+void recordPotChange(float ambient_light, int motion_detected, float sin_hour,
+                     float cos_hour, int time_period, int day_of_week,
+                     int pot_value, float final_brightness, unsigned long timestamp) {
+  /*
+   * Record a confirmed potentiometer change into the daily buffer
+   */
+  
+  if (pot_change_buffer_index < MAX_POT_CHANGES_BUFFER) {
+    PotChangeRecord &record = pot_change_buffer[pot_change_buffer_index];
+    record.ambient_light = ambient_light;
+    record.motion_detected = motion_detected;
+    record.sin_hour = sin_hour;
+    record.cos_hour = cos_hour;
+    record.time_period = time_period;
+    record.day_of_week = day_of_week;
+    record.pot_value = pot_value;
+    record.final_brightness = final_brightness;
+    record.timestamp = timestamp;
+    record.valid = true;
+    
+    pot_change_buffer_index++;
+  }
+  
+  pot_change_count_today++;
+  
+  Serial.println();
+  Serial.print(F(">>> POT CHANGE #"));
+  Serial.print(pot_change_count_today);
+  Serial.print(F(" RECORDED (stable for 5s) | Pot ADC="));
+  Serial.print(pot_value);
+  Serial.print(F(" | Brightness="));
+  Serial.print(final_brightness, 1);
+  Serial.println(F("% <<<"));
+  Serial.println();
+}
+
+void checkScheduledRetraining(DateTime &now) {
+  /*
+   * Check if it's time for scheduled retraining:
+   *   - Daily at 00:00:01
+   *   - Reset daily counters at midnight
+   */
+  
+  int current_day = now.day();
+  
+  // Reset daily state when a new day starts
+  if (current_day != last_retrain_day && last_retrain_day != -1) {
+    // New day detected - reset daily counters
+    pot_change_count_today = 0;
+    retrained_at_midnight = false;
+    retrained_at_20_changes = false;
+    last_retrain_day = current_day;
+  }
+  
+  // Initialize last_retrain_day on first run
+  if (last_retrain_day == -1) {
+    last_retrain_day = current_day;
+  }
+  
+  // Check for midnight retraining (00:00:01)
+  if (now.hour() == RETRAIN_HOUR && now.minute() == RETRAIN_MINUTE && 
+      now.second() >= RETRAIN_SECOND && now.second() <= RETRAIN_SECOND + 2 &&
+      !retrained_at_midnight) {
+    
+    Serial.println();
+    Serial.println(F(">>> MIDNIGHT RETRAINING TRIGGERED (00:00:01) <<<"));
+    Serial.print(F("Total pot changes today: "));
+    Serial.println(pot_change_count_today);
+    
+    performRetraining();
+    retrained_at_midnight = true;
+    
+    // Reset for new day
+    pot_change_count_today = 0;
+    retrained_at_20_changes = false;
+  }
+}
+
+void performRetraining() {
+  /*
+   * Perform model retraining using collected potentiometer change data.
+   * Transfers pot change records into the learning buffer for online adaptation.
+   */
+  
+  Serial.println(F("─────────────────────────────────────────────"));
+  Serial.println(F("    RETRAINING MODEL WITH POT CHANGE DATA    "));
+  Serial.println(F("─────────────────────────────────────────────"));
+  Serial.print(F("Records to process: "));
+  Serial.println(pot_change_buffer_index);
+  
+  if (pot_change_buffer_index == 0) {
+    Serial.println(F("No pot change data available for retraining. Skipping."));
+    Serial.println(F("─────────────────────────────────────────────"));
+    return;
+  }
+  
+  // Transfer pot change data into the learning buffer
+  int records_processed = 0;
+  for (int i = 0; i < pot_change_buffer_index; i++) {
+    PotChangeRecord &pot_record = pot_change_buffer[i];
+    if (!pot_record.valid) continue;
+    
+    // Convert pot change to a learning record
+    LearningRecord learn_record;
+    learn_record.ambient_light = pot_record.ambient_light;
+    learn_record.motion_detected = pot_record.motion_detected;
+    learn_record.sin_hour = pot_record.sin_hour;
+    learn_record.cos_hour = pot_record.cos_hour;
+    learn_record.time_period = pot_record.time_period;
+    learn_record.day_of_week = pot_record.day_of_week;
+    learn_record.user_preferred_brightness = pot_record.final_brightness;
+    learn_record.timestamp = pot_record.timestamp;
+    learn_record.valid = true;
+    
+    // Store in learning ring buffer
+    learning_buffer[learning_buffer_index] = learn_record;
+    learning_buffer_index = (learning_buffer_index + 1) % 10;
+    if (learning_count < 10) {
+      learning_count++;
+    }
+    
+    records_processed++;
+    learning_events++;
+  }
+  
+  Serial.print(F("Records processed into learning model: "));
+  Serial.println(records_processed);
+  
+  // Save updated learning data to EEPROM
+  saveLearningData();
+  
+  // Clear the pot change buffer after retraining
+  for (int i = 0; i < MAX_POT_CHANGES_BUFFER; i++) {
+    pot_change_buffer[i].valid = false;
+  }
+  pot_change_buffer_index = 0;
+  
+  Serial.println(F("Retraining complete. Learning model updated."));
+  Serial.println(F("─────────────────────────────────────────────"));
+  Serial.println();
+}
+
+// ============================================
 // UTILITY FUNCTIONS
 // ============================================
 
@@ -608,6 +863,19 @@ void handleSerialCommand() {
     Serial.println(learning_events);
     Serial.print(F("Learning Samples: "));
     Serial.println(learning_count);
+    Serial.println(F("\n=== Retraining Status ==="));
+    Serial.print(F("Pot Changes Today: "));
+    Serial.print(pot_change_count_today);
+    Serial.print(F("/"));
+    Serial.println(MAX_CHANGES_BEFORE_RETRAIN);
+    Serial.print(F("Pot Change Buffer: "));
+    Serial.print(pot_change_buffer_index);
+    Serial.print(F("/"));
+    Serial.println(MAX_POT_CHANGES_BUFFER);
+    Serial.print(F("Midnight Retrain Done: "));
+    Serial.println(retrained_at_midnight ? "Yes" : "No");
+    Serial.print(F("20-Change Retrain Done: "));
+    Serial.println(retrained_at_20_changes ? "Yes" : "No");
     Serial.println();
   } else if (cmd == "time") {
     // Print current time
@@ -645,6 +913,10 @@ void handleSerialCommand() {
     clearLearningData();
   } else if (cmd == "savelearning") {
     saveLearningData();
+  } else if (cmd == "retrain") {
+    // Manually trigger retraining
+    Serial.println(F("\nManual retraining triggered..."));
+    performRetraining();
   } else if (cmd.startsWith("settime ")) {
     // Set time manually: settime HH:MM:SS
     String timeStr = cmd.substring(8);
@@ -681,7 +953,13 @@ void handleSerialCommand() {
     Serial.println(F("│ learning          - Show learning data details              │"));
     Serial.println(F("│ clearlearning     - Clear all learning data                 │"));
     Serial.println(F("│ savelearning      - Manually save learning data to EEPROM   │"));
+    Serial.println(F("│ retrain           - Manually trigger retraining now         │"));
     Serial.println(F("│ help              - Show this help menu                     │"));
+    Serial.println(F("├─────────────────────────────────────────────────────────────┤"));
+    Serial.println(F("│ RETRAINING SCHEDULE:                                        │"));
+    Serial.println(F("│  - Pot change recorded when stable for 5 seconds            │"));
+    Serial.println(F("│  - Auto retrain at 00:00:01 daily                           │"));
+    Serial.println(F("│  - Immediate retrain if 20+ changes in 24 hours             │"));
     Serial.println(F("└─────────────────────────────────────────────────────────────┘"));
     Serial.println();
   } else if (cmd.length() > 0) {

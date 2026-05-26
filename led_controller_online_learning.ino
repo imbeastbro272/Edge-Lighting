@@ -493,7 +493,7 @@ void saveLearningData() {
   addr += sizeof(EEPROMHeader);
   
   // Write learning records
-  for (int i = 0; i < header.learning_samples_count && addr < EEPROM_SIZE - sizeof(LearningRecord); i++) {
+  for (int i = 0; i < (int)header.learning_samples_count && addr < EEPROM_SIZE - sizeof(LearningRecord); i++) {
     EEPROM.put(addr, learning_buffer[i]);
     addr += sizeof(LearningRecord);
   }
@@ -529,7 +529,7 @@ void loadLearningData() {
   }
   
   // Load learning records
-  learning_count = min(header.learning_samples_count, 10);
+  learning_count = min((int)header.learning_samples_count, 10);
   for (int i = 0; i < learning_count && addr < EEPROM_SIZE - sizeof(LearningRecord); i++) {
     EEPROM.get(addr, learning_buffer[i]);
     addr += sizeof(LearningRecord);

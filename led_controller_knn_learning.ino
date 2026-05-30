@@ -6,10 +6,14 @@
  *     (tree_rules.h). It is never modified.
  *   - User feedback samples are stored in EEPROM and mirrored to a RAM cache.
  *   - On every prediction we apply a HARD time/day gate before any KNN math:
- *       eligible(sample) := sample.day_of_week == current.day_of_week
- *                        && |sample.minute_of_day - current.minute_of_day| <= time_window_min
+ *       eligible(sample) := (sample.day_of_week == current.day_of_week
+ *                              AND |sample.minute_of_day - current.minute_of_day| <= window)
+ *                        OR (midnight bridge: adjacent day-of-week, BOTH endpoints
+ *                              within `window` minutes of 00:00).
  *     Samples outside the gate contribute NOTHING. They cannot leak into
  *     other hours of the day or into other days of the week.
+ *     The midnight bridge means Sat 23:55 <-> Sun 00:05 IS matched; Sat 23:55
+ *     <-> Sun 12:00 IS NOT.
  *   - Among eligible samples, the correction is a Gaussian-kernel weighted
  *     average of (target - tree_at_sample) using ambient + motion as the
  *     distance features (time/day are already equal by virtue of the gate).
@@ -36,7 +40,9 @@
  *   a stored sample back into the tree to compute its residual).
  *
  * COMMANDS:
- *   help, stats, samples, clearsamples, modelinfo, knninfo, resetmodel
+ *   help, stats, samples, modelinfo, knninfo
+ *   clearsamples     - wipe samples only (keeps K, sigma, window)
+ *   resetmodel       - wipe samples AND restore default K/sigma/window
  *   setk N           - K neighbors (1..MAX_TRAINING_SAMPLES)
  *   setsigma X       - kernel bandwidth (>0)
  *   setwindow N      - time gate window in minutes (1..720)
@@ -433,19 +439,40 @@ float predict_knn(float ambient, int motion, int hour_of_day, int minute_in_hour
     return tree_pred;
   }
 
-  // 2. HARD GATE: same day_of_week AND minute-of-day within window.
-  //    No wrap across midnight (Sat 23:55 does NOT match Sun 00:05).
+  // 2. HARD GATE: same day_of_week AND minute-of-day within window,
+  //    PLUS a midnight bridge: a sample on the previous/next day-of-week is
+  //    eligible only if BOTH endpoints sit within `window` minutes of 00:00.
+  //    Example (window=10): Sat 23:55 <-> Sun 00:05 is allowed; Sat 23:55
+  //    <-> Sun 12:00 is not.
   int eligible[MAX_TRAINING_SAMPLES];
   int eligible_count = 0;
   int window = knn_cfg.time_window_min;
+  int prev_day = (day + 6) % 7;     // day - 1 mod 7
+  int next_day = (day + 1) % 7;     // day + 1 mod 7
 
   for (int i = 0; i < training_sample_count; i++) {
     const TrainingSample &s = samples_cache[i];
-    if (s.day_of_week != day) continue;
-    int dt = s.minute_of_day - cur_mod;
-    if (dt < 0) dt = -dt;
-    if (dt > window) continue;
-    eligible[eligible_count++] = i;
+    int s_day = s.day_of_week;
+    int s_mod = s.minute_of_day;
+    bool keep  = false;
+
+    if (s_day == day) {
+      int dt = s_mod - cur_mod;
+      if (dt < 0) dt = -dt;
+      if (dt <= window) keep = true;
+    } else if (s_day == prev_day &&
+               s_mod  >= 1440 - window &&    // sample late on previous day
+               cur_mod <= window) {           // current is early on this day
+      int dt = (1440 - s_mod) + cur_mod;
+      if (dt <= window) keep = true;
+    } else if (s_day == next_day &&
+               s_mod  <= window &&            // sample early on next day
+               cur_mod >= 1440 - window) {    // current is late on this day
+      int dt = s_mod + (1440 - cur_mod);
+      if (dt <= window) keep = true;
+    }
+
+    if (keep) eligible[eligible_count++] = i;
   }
 
   if (out_eligible_count) *out_eligible_count = eligible_count;
@@ -841,6 +868,7 @@ void cmdKnnInfo() {
   Serial.print(F("  Time window (+/-)    : ")); Serial.print(knn_cfg.time_window_min); Serial.println(F(" min"));
   Serial.print(F("  Stored samples       : ")); Serial.println(training_sample_count);
   Serial.println(F("  Eligibility gate     : same day_of_week AND |dt| <= window"));
+  Serial.println(F("                         OR adjacent-day midnight bridge"));
   Serial.println(F("  Distance metric      : ambient + motion (within-gate only)"));
   Serial.print(F("  AMBIENT_SCALE        : ")); Serial.println(AMBIENT_SCALE);
   Serial.println();
@@ -879,10 +907,10 @@ void cmdHelp() {
   Serial.println(F("help            - this message"));
   Serial.println(F("stats           - runtime statistics"));
   Serial.println(F("samples         - list stored user samples"));
-  Serial.println(F("clearsamples    - delete all stored samples"));
+  Serial.println(F("clearsamples    - wipe samples only (keeps K/sigma/window)"));
+  Serial.println(F("resetmodel      - wipe samples AND restore default K/sigma/window"));
   Serial.println(F("modelinfo       - model summary"));
   Serial.println(F("knninfo         - KNN configuration"));
-  Serial.println(F("resetmodel      - alias of clearsamples"));
   Serial.println(F("setk N          - K neighbors (1..MAX)"));
   Serial.println(F("setsigma X      - kernel bandwidth (>0)"));
   Serial.println(F("setwindow N     - time window in minutes (1..720)"));
@@ -921,10 +949,28 @@ void handleSerialCommand() {
   else if (command == "knninfo") {
     cmdKnnInfo();
   }
-  else if (command == "clearsamples" || command == "resetmodel") {
+  else if (command == "clearsamples") {
+    // Wipe ONLY the stored user samples; keep current K / sigma / window.
     wipeAllSamples();
     Serial.println();
-    Serial.println(F("[v] All samples cleared. Tree-only mode active."));
+    Serial.println(F("[v] All user samples cleared."));
+    Serial.println(F("    KNN config (K, sigma, window) preserved."));
+    Serial.println(F("    Tree-only mode is now active until new samples arrive."));
+    Serial.println();
+  }
+  else if (command == "resetmodel") {
+    // Full reset: wipe samples AND restore default KNN config.
+    wipeAllSamples();
+    initializeKnnConfig();
+    saveKnnConfig();
+    Serial.println();
+    Serial.println(F("[v] Full model reset:"));
+    Serial.println(F("    - all user samples cleared"));
+    Serial.println(F("    - K, sigma_kernel, sigma_confidence, time_window restored to defaults"));
+    Serial.print  (F("    - K=")); Serial.print(knn_cfg.k_neighbors);
+    Serial.print  (F(" sigma_k=")); Serial.print(knn_cfg.sigma_kernel, 3);
+    Serial.print  (F(" sigma_c=")); Serial.print(knn_cfg.sigma_confidence, 3);
+    Serial.print  (F(" window=+/-")); Serial.print(knn_cfg.time_window_min); Serial.println(F(" min"));
     Serial.println();
   }
   else if (command.startsWith("setk ")) {

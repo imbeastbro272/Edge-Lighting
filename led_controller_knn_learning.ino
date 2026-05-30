@@ -772,6 +772,26 @@ void checkDailyRollover(DateTime &now) {
 }
 
 // ============================================
+// COMMAND HELPERS
+// ============================================
+
+// Tokenize a String by whitespace into out[0..max-1].
+// Returns the number of tokens found (capped at max).
+static int tokenizeArgs(const String &s, String *out, int max_tokens) {
+  int count = 0;
+  int len   = s.length();
+  int i     = 0;
+  while (i < len && count < max_tokens) {
+    while (i < len && (s[i] == ' ' || s[i] == '\t')) i++;
+    if (i >= len) break;
+    int start = i;
+    while (i < len && s[i] != ' ' && s[i] != '\t') i++;
+    out[count++] = s.substring(start, i);
+  }
+  return count;
+}
+
+// ============================================
 // COMMAND IMPLEMENTATIONS
 // ============================================
 
@@ -1005,67 +1025,89 @@ void handleSerialCommand() {
     }
   }
   else if (command.startsWith("addsample ")) {
-    int hh, mm, dd, mot;
-    float amb, br;
+    String args = command.substring(10);
+    args.trim();
 
-    // Try 6-arg form: HH MM DD AMB MOT BR
-    int p6 = sscanf(command.c_str(), "addsample %d %d %d %f %d %f",
-                    &hh, &mm, &dd, &amb, &mot, &br);
-    bool used6 = false;
-    if (p6 == 6) {
-      if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59 &&
-          dd >= 0 && dd <= 6  && amb >= 0 && amb <= 100000 &&
-          (mot == 0 || mot == 1) && br >= 0 && br <= 100) {
-        used6 = true;
-      }
+    String tok[8];
+    int n = tokenizeArgs(args, tok, 8);
+
+    int   hh = 0, mm = 0, dd = 0, mot = 0;
+    float amb = 0.0f, br = 0.0f;
+
+    if (n == 6) {
+      // HH MM DD AMBIENT MOTION BRIGHTNESS
+      hh  = tok[0].toInt();
+      mm  = tok[1].toInt();
+      dd  = tok[2].toInt();
+      amb = tok[3].toFloat();
+      mot = tok[4].toInt();
+      br  = tok[5].toFloat();
+    } else if (n == 5) {
+      // HH DD AMBIENT MOTION BRIGHTNESS  (minute defaults to 0)
+      hh  = tok[0].toInt();
+      mm  = 0;
+      dd  = tok[1].toInt();
+      amb = tok[2].toFloat();
+      mot = tok[3].toInt();
+      br  = tok[4].toFloat();
+    } else {
+      Serial.print(F("[x] Expected 5 or 6 numeric arguments after 'addsample', got "));
+      Serial.println(n);
+      Serial.println(F("    addsample HH DD AMBIENT MOTION BRIGHTNESS         (5 args)"));
+      Serial.println(F("    addsample HH MM DD AMBIENT MOTION BRIGHTNESS      (6 args)"));
+      return;
     }
-    if (!used6) {
-      // 5-arg form: HH DD AMB MOT BR  (minute = 0)
-      int p5 = sscanf(command.c_str(), "addsample %d %d %f %d %f",
-                      &hh, &dd, &amb, &mot, &br);
-      mm = 0;
-      if (p5 == 5) {
-        if (hh < 0  || hh > 23)             { Serial.println(F("[x] Hour 0..23")); return; }
-        if (dd < 0  || dd > 6)              { Serial.println(F("[x] Day 0..6"));   return; }
-        if (amb < 0 || amb > 100000)        { Serial.println(F("[x] Ambient 0..100000")); return; }
-        if (mot != 0 && mot != 1)           { Serial.println(F("[x] Motion 0/1")); return; }
-        if (br < 0  || br > 100)            { Serial.println(F("[x] Brightness 0..100")); return; }
-      } else {
-        Serial.println(F("[x] Use: addsample HH [MM] DD AMBIENT MOTION BRIGHTNESS"));
-        return;
-      }
-    }
+
+    if (hh < 0  || hh > 23)        { Serial.print(F("[x] Hour 0..23, got "));        Serial.println(hh);  return; }
+    if (mm < 0  || mm > 59)        { Serial.print(F("[x] Minute 0..59, got "));      Serial.println(mm);  return; }
+    if (dd < 0  || dd > 6)         { Serial.print(F("[x] Day 0..6 (0=Mon..6=Sun), got ")); Serial.println(dd); return; }
+    if (amb < 0 || amb > 100000)   { Serial.print(F("[x] Ambient 0..100000 lux, got ")); Serial.println(amb); return; }
+    if (mot != 0 && mot != 1)      { Serial.print(F("[x] Motion 0 or 1, got "));     Serial.println(mot); return; }
+    if (br < 0  || br > 100)       { Serial.print(F("[x] Brightness 0..100, got ")); Serial.println(br);  return; }
+
     addManualSample(hh, mm, dd, amb, mot, br);
   }
   else if (command.startsWith("test ")) {
-    int hh, mm, dd, mot, pot;
-    float amb;
+    String args = command.substring(5);
+    args.trim();
 
-    int p6 = sscanf(command.c_str(), "test %d %d %d %f %d %d",
-                    &hh, &mm, &dd, &amb, &mot, &pot);
-    bool used6 = false;
-    if (p6 == 6) {
-      if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59 &&
-          dd >= 0 && dd <= 6  && amb >= 0 && amb <= 100000 &&
-          (mot == 0 || mot == 1) && pot >= 0 && pot <= 4095) {
-        used6 = true;
-      }
+    String tok[8];
+    int n = tokenizeArgs(args, tok, 8);
+
+    int   hh = 0, mm = 0, dd = 0, mot = 0, pot = 0;
+    float amb = 0.0f;
+
+    if (n == 6) {
+      // HH MM DD AMBIENT MOTION POT
+      hh  = tok[0].toInt();
+      mm  = tok[1].toInt();
+      dd  = tok[2].toInt();
+      amb = tok[3].toFloat();
+      mot = tok[4].toInt();
+      pot = tok[5].toInt();
+    } else if (n == 5) {
+      // HH DD AMBIENT MOTION POT  (minute defaults to 0)
+      hh  = tok[0].toInt();
+      mm  = 0;
+      dd  = tok[1].toInt();
+      amb = tok[2].toFloat();
+      mot = tok[3].toInt();
+      pot = tok[4].toInt();
+    } else {
+      Serial.print(F("[x] Expected 5 or 6 numeric arguments after 'test', got "));
+      Serial.println(n);
+      Serial.println(F("    test HH DD AMBIENT MOTION POT         (5 args)"));
+      Serial.println(F("    test HH MM DD AMBIENT MOTION POT      (6 args)"));
+      return;
     }
-    if (!used6) {
-      int p5 = sscanf(command.c_str(), "test %d %d %f %d %d",
-                      &hh, &dd, &amb, &mot, &pot);
-      mm = 0;
-      if (p5 == 5) {
-        if (hh < 0  || hh > 23)             { Serial.println(F("[x] Hour 0..23")); return; }
-        if (dd < 0  || dd > 6)              { Serial.println(F("[x] Day 0..6"));   return; }
-        if (amb < 0 || amb > 100000)        { Serial.println(F("[x] Ambient 0..100000")); return; }
-        if (mot != 0 && mot != 1)           { Serial.println(F("[x] Motion 0/1")); return; }
-        if (pot < 0 || pot > 4095)          { Serial.println(F("[x] Pot 0..4095")); return; }
-      } else {
-        Serial.println(F("[x] Use: test HH [MM] DD AMBIENT MOTION POT"));
-        return;
-      }
-    }
+
+    if (hh < 0  || hh > 23)        { Serial.print(F("[x] Hour 0..23, got "));        Serial.println(hh);  return; }
+    if (mm < 0  || mm > 59)        { Serial.print(F("[x] Minute 0..59, got "));      Serial.println(mm);  return; }
+    if (dd < 0  || dd > 6)         { Serial.print(F("[x] Day 0..6 (0=Mon..6=Sun), got ")); Serial.println(dd); return; }
+    if (amb < 0 || amb > 100000)   { Serial.print(F("[x] Ambient 0..100000 lux, got ")); Serial.println(amb); return; }
+    if (mot != 0 && mot != 1)      { Serial.print(F("[x] Motion 0 or 1, got "));     Serial.println(mot); return; }
+    if (pot < 0 || pot > 4095)     { Serial.print(F("[x] Pot 0..4095, got "));       Serial.println(pot); return; }
+
     testManualPrediction(hh, mm, dd, amb, mot, pot);
   }
   else if (command.length() > 0) {

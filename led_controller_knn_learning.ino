@@ -1,31 +1,49 @@
 /*
- * LED Brightness Controller with KNN-BASED INCREMENTAL LEARNING
+ * LED Brightness Controller with KNN-BASED INCREMENTAL LEARNING (TIME-LOCAL)
  *
- * APPROACH (Option A: Tree + KNN Residual Correction):
- *   - The pre-trained Decision Tree (2000 samples) remains FROZEN as the base predictor.
- *     It is never modified; tree_rules.h is the source of truth for "general behavior".
- *   - User feedback samples are stored in EEPROM AND mirrored to a RAM cache for speed.
- *   - On every prediction:
- *       1. tree_pred       = decision tree output for current features
- *       2. residuals[i]    = sample[i].target - tree_pred(at sample[i])
- *       3. dist[i]         = importance-weighted distance from current input to sample[i]
- *       4. correction      = Gaussian-kernel-weighted average of residuals from K nearest
- *       5. confidence      = exp(-min_dist / sigma_conf)  (drops if no nearby samples)
- *       6. final           = tree_pred + confidence * correction
+ * APPROACH:
+ *   - The pre-trained Decision Tree (2000 samples) stays FROZEN as the base predictor
+ *     (tree_rules.h). It is never modified.
+ *   - User feedback samples are stored in EEPROM and mirrored to a RAM cache.
+ *   - On every prediction we apply a HARD time/day gate before any KNN math:
+ *       eligible(sample) := sample.day_of_week == current.day_of_week
+ *                        && |sample.minute_of_day - current.minute_of_day| <= time_window_min
+ *     Samples outside the gate contribute NOTHING. They cannot leak into
+ *     other hours of the day or into other days of the week.
+ *   - Among eligible samples, the correction is a Gaussian-kernel weighted
+ *     average of (target - tree_at_sample) using ambient + motion as the
+ *     distance features (time/day are already equal by virtue of the gate).
  *
- * PROPERTIES:
- *   - Adding ANY user sample influences ONLY predictions near that point in feature space.
- *     There is no global leakage like the previous linear-correction model had.
- *   - Contradictory samples are handled gracefully: only co-located samples average.
- *   - Works immediately after a single sample is added; no "retraining" pass required.
- *   - O(N) per prediction for N samples. With N=100 samples the cost is microseconds.
+ * PIPELINE per prediction:
+ *   1. tree_pred = predict_brightness(features)
+ *   2. eligible  = filter(samples, same day AND |dt| <= window)
+ *   3. if eligible empty -> return tree_pred (no correction at all)
+ *   4. for each eligible sample:
+ *        residual_i = target_i - tree_pred(sample_i)
+ *        dist_i^2   = w_amb*(d_amb/scale)^2 + w_mot*(d_mot)^2
+ *   5. take K nearest by dist^2
+ *   6. correction = sum(w_i * residual_i) / sum(w_i)
+ *      where w_i  = exp(-dist_i^2 / (2*sigma_kernel^2))
+ *   7. confidence = exp(-min_dist^2 / (2*sigma_confidence^2))
+ *   8. final = clamp(tree_pred + confidence * correction, 0, 100)
+ *
+ * SAMPLE STORAGE FIELDS (24 bytes per sample):
+ *   ambient_light, motion_detected, day_of_week, minute_of_day,
+ *   target_brightness, timestamp
+ *
+ *   sin_hour, cos_hour, time_period are NOT stored anymore -
+ *   they are recomputed from minute_of_day when needed (i.e. when feeding
+ *   a stored sample back into the tree to compute its residual).
  *
  * COMMANDS:
  *   help, stats, samples, clearsamples, modelinfo, knninfo, resetmodel
- *   addsample HH DD AMBIENT MOTION BRIGHTNESS
- *   test HH DD AMBIENT MOTION POT
- *   setk N           - change number of neighbors (1..MAX_TRAINING_SAMPLES)
- *   setsigma X       - change kernel bandwidth (e.g. 0.25)
+ *   setk N           - K neighbors (1..MAX_TRAINING_SAMPLES)
+ *   setsigma X       - kernel bandwidth (>0)
+ *   setwindow N      - time gate window in minutes (1..720)
+ *   addsample HH DD AMBIENT MOTION BRIGHTNESS              (minute = 0)
+ *   addsample HH MM DD AMBIENT MOTION BRIGHTNESS           (with minute)
+ *   test HH DD AMBIENT MOTION POT                          (minute = 0)
+ *   test HH MM DD AMBIENT MOTION POT                       (with minute)
  */
 
 #include <Wire.h>
@@ -55,67 +73,68 @@
 
 #define POT_STABLE_DURATION    5000
 #define POT_CHANGE_THRESHOLD   50
-#define MAX_CHANGES_BEFORE_REFRESH 20
 
 #define EEPROM_SIZE        4096
 
 // ============================================
-// FEATURE IMPORTANCE (from DT analysis)
-// Used as weights in the KNN distance metric.
+// FEATURE WEIGHTS (within-gate KNN distance)
+// Only ambient + motion participate now; time and day are gated.
 // ============================================
 
-#define IMPORTANCE_AMBIENT      0.254848f
-#define IMPORTANCE_MOTION       0.229156f
-#define IMPORTANCE_SIN_HOUR     0.048563f
-#define IMPORTANCE_COS_HOUR     0.040571f
-#define IMPORTANCE_TIME_PERIOD  0.018088f
-#define IMPORTANCE_DAY_OF_WEEK  0.001244f
+#define IMPORTANCE_AMBIENT   0.254848f
+#define IMPORTANCE_MOTION    0.229156f
 
-// Normalisation scale for ambient (lux) -> roughly unit range
-#define AMBIENT_SCALE      1000.0f
+// Lux normalisation scale for distance metric
+#define AMBIENT_SCALE        1000.0f
+
+// ============================================
+// EEPROM LAYOUT
+// ============================================
+
+#define EEPROM_SAMPLE_COUNT_ADDR    0    // int (4 bytes)
+#define EEPROM_NEXT_WRITE_IDX_ADDR  4    // int (4 bytes)
+#define EEPROM_KNN_CONFIG_ADDR      8    // KnnConfig (20 bytes)
+#define EEPROM_SAMPLES_MAGIC_ADDR   28   // uint32_t (4 bytes) - sample-format version magic
+#define EEPROM_SAMPLES_START        100
+
+// Magic numbers identify storage format; mismatch triggers safe re-init.
+#define KNN_CONFIG_MAGIC      0xC0FFEE02
+#define SAMPLES_FORMAT_MAGIC  0xBEEF0002
 
 // ============================================
 // TRAINING SAMPLE STORAGE
 // ============================================
 
-#define MAX_TRAINING_SAMPLES        100
-#define SAMPLE_SIZE                 32     // sizeof(TrainingSample) on ESP32
-#define EEPROM_SAMPLE_COUNT_ADDR    0
-#define EEPROM_NEXT_WRITE_IDX_ADDR  4
-#define EEPROM_KNN_CONFIG_ADDR      8
-#define EEPROM_SAMPLES_START        100
+#define MAX_TRAINING_SAMPLES   100
+#define SAMPLE_SIZE            24    // sizeof(TrainingSample) - keep in sync!
 
 struct TrainingSample {
-  float    ambient_light;
-  float    sin_hour;
-  float    cos_hour;
-  int      motion_detected;
-  int      time_period;
-  int      day_of_week;
-  float    target_brightness;
-  uint32_t timestamp;
-};
+  float    ambient_light;     // 4
+  int      motion_detected;   // 4
+  int      day_of_week;       // 4   (0=Mon .. 6=Sun)
+  int      minute_of_day;     // 4   (0..1439)
+  float    target_brightness; // 4
+  uint32_t timestamp;         // 4
+};                            // total: 24
 
-// In-RAM cache of all stored samples for fast KNN lookup.
 TrainingSample samples_cache[MAX_TRAINING_SAMPLES];
 
-int training_sample_count = 0;   // valid entries in cache (0..MAX)
-int next_write_idx        = 0;   // circular-buffer write head
+int training_sample_count = 0;
+int next_write_idx        = 0;
 
 // ============================================
 // KNN CONFIG (persisted)
 // ============================================
 
 struct KnnConfig {
-  int    k_neighbors;       // number of neighbors used in correction
-  float  sigma_kernel;      // bandwidth of the Gaussian kernel over distances
-  float  sigma_confidence;  // bandwidth controlling fall-off to tree-only when far
-  uint32_t magic;           // sanity check value
-};
+  int      k_neighbors;       // 4
+  float    sigma_kernel;      // 4
+  float    sigma_confidence;  // 4
+  int      time_window_min;   // 4   - same day + |dt| <= this many minutes
+  uint32_t magic;             // 4
+};                            // total: 20
 
 KnnConfig knn_cfg;
-
-#define KNN_MAGIC  0xCAFEBABE
 
 // ============================================
 // MANUAL INPUT MODE
@@ -160,11 +179,11 @@ float avg_brightness           = 0;
 // FORWARD DECLARATIONS
 // ============================================
 
-float predict_knn(float ambient, int motion, float sin_h, float cos_h,
-                  int period, int day,
+float predict_knn(float ambient, int motion, int hour_of_day, int minute_in_hour,
+                  int day,
                   float *out_tree_pred, float *out_correction,
                   float *out_confidence, float *out_min_dist,
-                  int *out_neighbors_used);
+                  int *out_neighbors_used, int *out_eligible_count);
 float readLDR();
 int   readManualOffset();
 int   getTimePeriod(int hour);
@@ -172,10 +191,22 @@ void  printDateTime(DateTime dt);
 void  handleSerialCommand();
 void  monitorPotForSampleCapture(unsigned long current_time, float ml_pred, float user_brightness);
 void  checkDailyRollover(DateTime &now);
+static inline void sampleTreeFeatures(const TrainingSample &s,
+                                      float *sin_h, float *cos_h, int *period);
 
 // ============================================
 // EEPROM / CACHE MANAGEMENT
 // ============================================
+
+void wipeAllSamples() {
+  training_sample_count = 0;
+  next_write_idx        = 0;
+  EEPROM.put(EEPROM_SAMPLE_COUNT_ADDR,   training_sample_count);
+  EEPROM.put(EEPROM_NEXT_WRITE_IDX_ADDR, next_write_idx);
+  uint32_t magic = SAMPLES_FORMAT_MAGIC;
+  EEPROM.put(EEPROM_SAMPLES_MAGIC_ADDR, magic);
+  EEPROM.commit();
+}
 
 void loadSamplesFromEEPROM() {
   for (int i = 0; i < training_sample_count; i++) {
@@ -188,20 +219,30 @@ void loadSamplesFromEEPROM() {
 }
 
 void initializeTrainingStorage() {
-  EEPROM.get(EEPROM_SAMPLE_COUNT_ADDR,   training_sample_count);
-  EEPROM.get(EEPROM_NEXT_WRITE_IDX_ADDR, next_write_idx);
+  // Check sample-format magic; on mismatch the on-disk samples are from a
+  // previous firmware version with a different struct layout - wipe them.
+  uint32_t magic_on_disk = 0;
+  EEPROM.get(EEPROM_SAMPLES_MAGIC_ADDR, magic_on_disk);
 
-  if (training_sample_count < 0 || training_sample_count > MAX_TRAINING_SAMPLES) {
-    training_sample_count = 0;
-    next_write_idx        = 0;
-    EEPROM.put(EEPROM_SAMPLE_COUNT_ADDR,   training_sample_count);
-    EEPROM.put(EEPROM_NEXT_WRITE_IDX_ADDR, next_write_idx);
-    EEPROM.commit();
-  }
-  if (next_write_idx < 0 || next_write_idx >= MAX_TRAINING_SAMPLES) {
-    next_write_idx = training_sample_count % MAX_TRAINING_SAMPLES;
-    EEPROM.put(EEPROM_NEXT_WRITE_IDX_ADDR, next_write_idx);
-    EEPROM.commit();
+  if (magic_on_disk != SAMPLES_FORMAT_MAGIC) {
+    Serial.println(F("[storage] Sample format changed - wiping old samples"));
+    wipeAllSamples();
+  } else {
+    EEPROM.get(EEPROM_SAMPLE_COUNT_ADDR,   training_sample_count);
+    EEPROM.get(EEPROM_NEXT_WRITE_IDX_ADDR, next_write_idx);
+
+    if (training_sample_count < 0 || training_sample_count > MAX_TRAINING_SAMPLES) {
+      training_sample_count = 0;
+      next_write_idx        = 0;
+      EEPROM.put(EEPROM_SAMPLE_COUNT_ADDR,   training_sample_count);
+      EEPROM.put(EEPROM_NEXT_WRITE_IDX_ADDR, next_write_idx);
+      EEPROM.commit();
+    }
+    if (next_write_idx < 0 || next_write_idx >= MAX_TRAINING_SAMPLES) {
+      next_write_idx = training_sample_count % MAX_TRAINING_SAMPLES;
+      EEPROM.put(EEPROM_NEXT_WRITE_IDX_ADDR, next_write_idx);
+      EEPROM.commit();
+    }
   }
 
   Serial.print(F("Training samples in EEPROM: "));
@@ -211,7 +252,6 @@ void initializeTrainingStorage() {
 }
 
 void saveTrainingSample(const TrainingSample &sample) {
-  // Circular buffer: write at next_write_idx, increment, advance count up to MAX.
   int slot = next_write_idx;
 
   samples_cache[slot] = sample;
@@ -233,7 +273,6 @@ void saveTrainingSample(const TrainingSample &sample) {
 }
 
 TrainingSample loadTrainingSample(int index) {
-  // Read from RAM cache (fast). EEPROM is the persistence backing store only.
   return samples_cache[index];
 }
 
@@ -242,17 +281,19 @@ void captureTrainingSample(float tree_pred, float user_brightness) {
 
   TrainingSample sample;
   sample.ambient_light     = smoothed_ldr;
-  sample.sin_hour          = sin(2.0 * PI * now.hour() / 24.0);
-  sample.cos_hour          = cos(2.0 * PI * now.hour() / 24.0);
   sample.motion_detected   = digitalRead(PIR_PIN);
-  sample.time_period       = getTimePeriod(now.hour());
-  sample.day_of_week       = (now.dayOfTheWeek() + 6) % 7;
+  sample.day_of_week       = (now.dayOfTheWeek() + 6) % 7;          // 0=Mon
+  sample.minute_of_day     = now.hour() * 60 + now.minute();        // RTC precision
   sample.target_brightness = user_brightness;
   sample.timestamp         = now.unixtime();
 
   saveTrainingSample(sample);
 
-  Serial.print(F("[capture] Ambient="));
+  Serial.print(F("[capture] "));
+  Serial.print(now.hour()); Serial.print(F(":"));
+  if (now.minute() < 10) Serial.print('0');
+  Serial.print(now.minute());
+  Serial.print(F("  Ambient="));
   Serial.print(sample.ambient_light);
   Serial.print(F(" Tree="));
   Serial.print(tree_pred);
@@ -261,14 +302,12 @@ void captureTrainingSample(float tree_pred, float user_brightness) {
   Serial.println(F("%"));
 }
 
-void addManualSample(int hour, int day, float ambient, int motion, float target_brightness) {
+void addManualSample(int hour, int minute, int day, float ambient, int motion, float target_brightness) {
   TrainingSample sample;
   sample.ambient_light     = ambient;
-  sample.sin_hour          = sin(2.0 * PI * hour / 24.0);
-  sample.cos_hour          = cos(2.0 * PI * hour / 24.0);
   sample.motion_detected   = motion;
-  sample.time_period       = getTimePeriod(hour);
   sample.day_of_week       = day;
+  sample.minute_of_day     = hour * 60 + minute;
   sample.target_brightness = target_brightness;
   sample.timestamp         = rtc.now().unixtime();
 
@@ -277,9 +316,12 @@ void addManualSample(int hour, int day, float ambient, int motion, float target_
   const char *day_names[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
   Serial.println();
   Serial.println(F("[v] MANUAL SAMPLE ADDED"));
-  Serial.print(F("    Hour: "));
+  Serial.print(F("    Time: "));
   Serial.print(hour);
-  Serial.print(F(":00, Day: "));
+  Serial.print(F(":"));
+  if (minute < 10) Serial.print('0');
+  Serial.print(minute);
+  Serial.print(F("  Day: "));
   Serial.println(day_names[day]);
   Serial.print(F("    Ambient: "));
   Serial.print(ambient);
@@ -297,9 +339,10 @@ void addManualSample(int hour, int day, float ambient, int motion, float target_
 
 void initializeKnnConfig() {
   knn_cfg.k_neighbors      = 5;
-  knn_cfg.sigma_kernel     = 0.25f;   // Gaussian bandwidth for neighbor weights
-  knn_cfg.sigma_confidence = 0.40f;   // Bandwidth for tree-vs-knn blending
-  knn_cfg.magic            = KNN_MAGIC;
+  knn_cfg.sigma_kernel     = 0.25f;
+  knn_cfg.sigma_confidence = 0.40f;
+  knn_cfg.time_window_min  = 10;       // +/- 10 minutes default
+  knn_cfg.magic            = KNN_CONFIG_MAGIC;
 }
 
 void saveKnnConfig() {
@@ -309,10 +352,15 @@ void saveKnnConfig() {
 
 void loadKnnConfig() {
   EEPROM.get(EEPROM_KNN_CONFIG_ADDR, knn_cfg);
-  if (knn_cfg.magic != KNN_MAGIC ||
-      knn_cfg.k_neighbors      < 1 || knn_cfg.k_neighbors      > MAX_TRAINING_SAMPLES ||
-      knn_cfg.sigma_kernel     <= 0.0f ||
-      knn_cfg.sigma_confidence <= 0.0f) {
+  bool valid = (knn_cfg.magic == KNN_CONFIG_MAGIC) &&
+               (knn_cfg.k_neighbors      >= 1) &&
+               (knn_cfg.k_neighbors      <= MAX_TRAINING_SAMPLES) &&
+               (knn_cfg.sigma_kernel     >  0.0f) &&
+               (knn_cfg.sigma_confidence >  0.0f) &&
+               (knn_cfg.time_window_min  >= 1) &&
+               (knn_cfg.time_window_min  <= 720);
+
+  if (!valid) {
     Serial.println(F("[knn] No valid saved config, using defaults"));
     initializeKnnConfig();
     saveKnnConfig();
@@ -322,45 +370,56 @@ void loadKnnConfig() {
     Serial.print(F(" sigma_k="));
     Serial.print(knn_cfg.sigma_kernel, 3);
     Serial.print(F(" sigma_c="));
-    Serial.println(knn_cfg.sigma_confidence, 3);
+    Serial.print(knn_cfg.sigma_confidence, 3);
+    Serial.print(F(" window=+/-"));
+    Serial.print(knn_cfg.time_window_min);
+    Serial.println(F(" min"));
   }
 }
 
 // ============================================
-// KNN DISTANCE METRIC
-// Importance-weighted squared distance over normalized features.
-// Categorical features (period, day) use 0/1 distance.
+// HELPER: derive tree-input features from a stored sample
 // ============================================
 
-static inline float knnDistanceSq(
-    float a_amb, int a_mot, float a_sin, float a_cos, int a_per, int a_day,
-    float b_amb, int b_mot, float b_sin, float b_cos, int b_per, int b_day) {
+static inline void sampleTreeFeatures(const TrainingSample &s,
+                                      float *sin_h, float *cos_h, int *period) {
+  int hour = s.minute_of_day / 60;          // hour bucket for tree features
+  *sin_h  = sin(2.0 * PI * hour / 24.0);
+  *cos_h  = cos(2.0 * PI * hour / 24.0);
+  *period = getTimePeriod(hour);
+}
+
+// ============================================
+// KNN DISTANCE METRIC (within-gate features only)
+// ============================================
+
+static inline float knnDistanceSq(float a_amb, int a_mot,
+                                  float b_amb, int b_mot) {
   float d_amb = (a_amb - b_amb) / AMBIENT_SCALE;
   float d_mot = (float)(a_mot - b_mot);
-  float d_sin = a_sin - b_sin;
-  float d_cos = a_cos - b_cos;
-  float d_per = (a_per == b_per) ? 0.0f : 1.0f;
-  float d_day = (a_day == b_day) ? 0.0f : 1.0f;
-
-  return  IMPORTANCE_AMBIENT     * d_amb * d_amb
-        + IMPORTANCE_MOTION      * d_mot * d_mot
-        + IMPORTANCE_SIN_HOUR    * d_sin * d_sin
-        + IMPORTANCE_COS_HOUR    * d_cos * d_cos
-        + IMPORTANCE_TIME_PERIOD * d_per
-        + IMPORTANCE_DAY_OF_WEEK * d_day;
+  return  IMPORTANCE_AMBIENT * d_amb * d_amb
+        + IMPORTANCE_MOTION  * d_mot * d_mot;
 }
 
 // ============================================
 // KNN PREDICTION (Tree + Local Residual Correction)
+//
+// Hard time/day gate is applied first; samples outside the gate are NOT
+// considered, so they cannot influence predictions in any other neighborhood.
 // ============================================
 
-float predict_knn(float ambient, int motion, float sin_h, float cos_h,
-                  int period, int day,
+float predict_knn(float ambient, int motion, int hour_of_day, int minute_in_hour,
+                  int day,
                   float *out_tree_pred, float *out_correction,
                   float *out_confidence, float *out_min_dist,
-                  int *out_neighbors_used) {
+                  int *out_neighbors_used, int *out_eligible_count) {
 
-  // 1. Base prediction from frozen decision tree
+  float sin_h    = sin(2.0 * PI * hour_of_day / 24.0);
+  float cos_h    = cos(2.0 * PI * hour_of_day / 24.0);
+  int   period   = getTimePeriod(hour_of_day);
+  int   cur_mod  = hour_of_day * 60 + minute_in_hour;
+
+  // 1. Frozen decision tree
   float tree_pred = predict_brightness(ambient, motion, sin_h, cos_h, period, day);
 
   if (out_tree_pred)      *out_tree_pred      = tree_pred;
@@ -368,56 +427,77 @@ float predict_knn(float ambient, int motion, float sin_h, float cos_h,
   if (out_confidence)     *out_confidence     = 0.0f;
   if (out_min_dist)       *out_min_dist       = INFINITY;
   if (out_neighbors_used) *out_neighbors_used = 0;
+  if (out_eligible_count) *out_eligible_count = 0;
 
   if (training_sample_count == 0) {
     return tree_pred;
   }
 
-  // 2. Compute distances and residuals against every cached sample
-  float distsq[MAX_TRAINING_SAMPLES];
-  int   order[MAX_TRAINING_SAMPLES];
+  // 2. HARD GATE: same day_of_week AND minute-of-day within window.
+  //    No wrap across midnight (Sat 23:55 does NOT match Sun 00:05).
+  int eligible[MAX_TRAINING_SAMPLES];
+  int eligible_count = 0;
+  int window = knn_cfg.time_window_min;
 
   for (int i = 0; i < training_sample_count; i++) {
     const TrainingSample &s = samples_cache[i];
-    distsq[i] = knnDistanceSq(
-      ambient, motion, sin_h, cos_h, period, day,
-      s.ambient_light, s.motion_detected, s.sin_hour, s.cos_hour,
-      s.time_period, s.day_of_week);
-    order[i] = i;
+    if (s.day_of_week != day) continue;
+    int dt = s.minute_of_day - cur_mod;
+    if (dt < 0) dt = -dt;
+    if (dt > window) continue;
+    eligible[eligible_count++] = i;
   }
 
-  // 3. Partial selection sort to find K nearest (K is small, ~3..7).
+  if (out_eligible_count) *out_eligible_count = eligible_count;
+
+  if (eligible_count == 0) {
+    // No nearby samples for this exact time/day -> tree only.
+    return tree_pred;
+  }
+
+  // 3. Compute distances over ambient+motion for eligible samples.
+  float distsq[MAX_TRAINING_SAMPLES];
+  for (int e = 0; e < eligible_count; e++) {
+    const TrainingSample &s = samples_cache[eligible[e]];
+    distsq[e] = knnDistanceSq(ambient, motion, s.ambient_light, s.motion_detected);
+  }
+
+  // 4. Pick K nearest among eligible (partial selection sort).
   int k_actual = knn_cfg.k_neighbors;
-  if (k_actual > training_sample_count) k_actual = training_sample_count;
+  if (k_actual > eligible_count) k_actual = eligible_count;
 
   for (int k = 0; k < k_actual; k++) {
     int min_idx = k;
-    for (int j = k + 1; j < training_sample_count; j++) {
-      if (distsq[order[j]] < distsq[order[min_idx]]) {
-        min_idx = j;
-      }
+    for (int j = k + 1; j < eligible_count; j++) {
+      if (distsq[j] < distsq[min_idx]) min_idx = j;
     }
-    int tmp = order[k]; order[k] = order[min_idx]; order[min_idx] = tmp;
+    if (min_idx != k) {
+      float td = distsq[k];   distsq[k]   = distsq[min_idx];   distsq[min_idx]   = td;
+      int   ti = eligible[k]; eligible[k] = eligible[min_idx]; eligible[min_idx] = ti;
+    }
   }
 
-  // 4. Gaussian-kernel-weighted average of residuals from K nearest
-  float sigma_k = knn_cfg.sigma_kernel;
-  float sigma_c = knn_cfg.sigma_confidence;
+  // 5. Gaussian-kernel weighted residual average.
+  float sigma_k        = knn_cfg.sigma_kernel;
+  float sigma_c        = knn_cfg.sigma_confidence;
   float two_sigma_k_sq = 2.0f * sigma_k * sigma_k;
 
   float weight_sum   = 0.0f;
   float residual_sum = 0.0f;
 
   for (int k = 0; k < k_actual; k++) {
-    int idx = order[k];
+    int idx = eligible[k];
     const TrainingSample &s = samples_cache[idx];
 
+    float s_sin, s_cos; int s_period;
+    sampleTreeFeatures(s, &s_sin, &s_cos, &s_period);
+
     float tree_pred_at_s = predict_brightness(
-      s.ambient_light, s.motion_detected, s.sin_hour, s.cos_hour,
-      s.time_period, s.day_of_week);
+      s.ambient_light, s.motion_detected,
+      s_sin, s_cos, s_period, s.day_of_week);
 
     float residual = s.target_brightness - tree_pred_at_s;
-    float w        = expf(-distsq[idx] / two_sigma_k_sq);
+    float w        = expf(-distsq[k] / two_sigma_k_sq);
 
     residual_sum += w * residual;
     weight_sum   += w;
@@ -425,28 +505,20 @@ float predict_knn(float ambient, int motion, float sin_h, float cos_h,
 
   float correction = (weight_sum > 1e-6f) ? (residual_sum / weight_sum) : 0.0f;
 
-  // 5. Confidence: drops with the distance to the nearest neighbor.
-  float min_dist_sq = distsq[order[0]];
+  // 6. Confidence based on distance to nearest neighbour.
+  float min_dist_sq = distsq[0];
   float confidence  = expf(-min_dist_sq / (2.0f * sigma_c * sigma_c));
 
   float final_pred = tree_pred + confidence * correction;
   if (final_pred < 0)   final_pred = 0;
   if (final_pred > 100) final_pred = 100;
 
-  if (out_tree_pred)      *out_tree_pred      = tree_pred;
   if (out_correction)     *out_correction     = correction;
   if (out_confidence)     *out_confidence     = confidence;
   if (out_min_dist)       *out_min_dist       = sqrtf(min_dist_sq);
   if (out_neighbors_used) *out_neighbors_used = k_actual;
 
   return final_pred;
-}
-
-// Convenience overload (no diagnostics)
-float predict_knn(float ambient, int motion, float sin_h, float cos_h,
-                  int period, int day) {
-  return predict_knn(ambient, motion, sin_h, cos_h, period, day,
-                     NULL, NULL, NULL, NULL, NULL);
 }
 
 // ============================================
@@ -458,7 +530,7 @@ void setup() {
   while (!Serial) { delay(10); }
 
   Serial.println(F("==================================="));
-  Serial.println(F("LED Controller v4.0 - KNN INCREMENTAL LEARNING"));
+  Serial.println(F("LED Controller v4.1 - KNN (TIME-LOCAL) LEARNING"));
   Serial.println(F("==================================="));
 
   pinMode(PIR_PIN, INPUT);
@@ -484,24 +556,23 @@ void setup() {
   printDateTime(rtc.now());
   Serial.println();
 
-  initializeTrainingStorage();
   loadKnnConfig();
+  initializeTrainingStorage();
 
   smoothed_ldr = readLDR();
 
   Serial.println(F("=== MODEL ==="));
   Serial.println(F("Base       : Decision Tree (2000 samples, frozen)"));
-  Serial.println(F("Personalize: KNN residual correction over user samples"));
+  Serial.println(F("Personalize: KNN, gated by same day-of-week + minute window"));
 
   Serial.println(F("=== Commands ==="));
-  Serial.println(F("help, stats, samples, clearsamples, modelinfo"));
-  Serial.println(F("knninfo, resetmodel"));
-  Serial.println(F("addsample HH DD AMBIENT MOTION BRIGHTNESS"));
-  Serial.println(F("test HH DD AMBIENT MOTION POT"));
-  Serial.println(F("setk N | setsigma X"));
+  Serial.println(F("help, stats, samples, clearsamples, modelinfo, knninfo, resetmodel"));
+  Serial.println(F("setk N | setsigma X | setwindow N"));
+  Serial.println(F("addsample HH [MM] DD AMBIENT MOTION BRIGHTNESS"));
+  Serial.println(F("test      HH [MM] DD AMBIENT MOTION POT"));
 
   Serial.println(F("=== Monitoring Started ==="));
-  Serial.println(F("|   Time   | Day | Hour | Ambient | Motion | Period |  Tree |  Adj |  ML% | Off | Final% | PWM |"));
+  Serial.println(F("|   Time   | Day | Hour | Ambient | Motion |  Tree |  Adj | Elig |  ML% | Off | Final% | PWM |"));
 }
 
 // ============================================
@@ -527,16 +598,13 @@ void loop() {
     smoothed_ldr = SMOOTHING_FACTOR * smoothed_ldr +
                    (1 - SMOOTHING_FACTOR) * ambient_light;
 
-    float sin_hour    = sin(2.0 * PI * hour / 24.0);
-    float cos_hour    = cos(2.0 * PI * hour / 24.0);
-    int   time_period = getTimePeriod(hour);
-
     float tree_pred, correction, confidence, min_dist;
-    int   neighbors_used;
+    int   neighbors_used, eligible_count;
     float ml_brightness = predict_knn(
-      smoothed_ldr, motion_detected, sin_hour, cos_hour,
-      time_period, day_of_week_adjusted,
-      &tree_pred, &correction, &confidence, &min_dist, &neighbors_used);
+      smoothed_ldr, motion_detected, hour, minute,
+      day_of_week_adjusted,
+      &tree_pred, &correction, &confidence, &min_dist,
+      &neighbors_used, &eligible_count);
 
     manual_offset = readManualOffset();
 
@@ -558,17 +626,17 @@ void loop() {
 
     const char *day_names[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
 
-    char line[180];
+    char line[200];
     sprintf(line,
-      "| %s | %3s | %2d | %6.1f |   %d   |   %d   | %4.1f | %+5.1f | %4.1f | %+3d | %5.1f | %3d |",
+      "| %s | %3s | %2d | %6.1f |   %d   | %4.1f | %+5.1f |  %2d  | %4.1f | %+3d | %5.1f | %3d |",
       time_str,
       day_names[day_of_week_adjusted],
       hour,
       smoothed_ldr,
       motion_detected,
-      time_period,
       tree_pred,
       confidence * correction,
+      eligible_count,
       ml_brightness,
       manual_offset,
       final_brightness,
@@ -620,15 +688,15 @@ int readManualOffset() {
 }
 
 int getTimePeriod(int hour) {
-  if (hour >= 4 && hour <= 6)  return 0;   // Early Morning
-  if (hour >  6 && hour <= 12) return 1;   // Morning
-  if (hour > 12 && hour <= 16) return 2;   // Afternoon
-  if (hour > 16 && hour <= 20) return 3;   // Evening
-  return 4;                                // Night
+  if (hour >= 4 && hour <= 6)  return 0;
+  if (hour >  6 && hour <= 12) return 1;
+  if (hour > 12 && hour <= 16) return 2;
+  if (hour > 16 && hour <= 20) return 3;
+  return 4;
 }
 
 // ============================================
-// SAMPLE-CAPTURE TRIGGER (pot adjustment)
+// POT-BASED SAMPLE CAPTURE
 // ============================================
 
 void monitorPotForSampleCapture(unsigned long current_time,
@@ -677,14 +745,11 @@ void checkDailyRollover(DateTime &now) {
 }
 
 // ============================================
-// SERIAL COMMAND HANDLER
+// COMMAND IMPLEMENTATIONS
 // ============================================
 
-void testManualPrediction(int hour, int day, float ambient, int motion, int pot_value) {
-  float sin_hour    = sin(2.0 * PI * hour / 24.0);
-  float cos_hour    = cos(2.0 * PI * hour / 24.0);
-  int   time_period = getTimePeriod(hour);
-
+void testManualPrediction(int hour, int minute, int day, float ambient,
+                          int motion, int pot_value) {
   int center = 2048;
   int offset = 0;
   if (pot_value < center - POT_DEADZONE) {
@@ -694,39 +759,47 @@ void testManualPrediction(int hour, int day, float ambient, int motion, int pot_
   }
 
   float tree_pred, correction, confidence, min_dist;
-  int   neighbors_used;
-  float knn_pred = predict_knn(ambient, motion, sin_hour, cos_hour, time_period, day,
+  int   neighbors_used, eligible_count;
+  float knn_pred = predict_knn(ambient, motion, hour, minute, day,
                                &tree_pred, &correction, &confidence,
-                               &min_dist, &neighbors_used);
+                               &min_dist, &neighbors_used, &eligible_count);
 
-  float tree_final = tree_pred + offset; if (tree_final < 0) tree_final = 0; if (tree_final > 100) tree_final = 100;
-  float knn_final  = knn_pred  + offset; if (knn_final  < 0) knn_final  = 0; if (knn_final  > 100) knn_final  = 100;
+  float tree_final = tree_pred + offset;
+  if (tree_final < 0) tree_final = 0; if (tree_final > 100) tree_final = 100;
+  float knn_final  = knn_pred  + offset;
+  if (knn_final  < 0) knn_final  = 0; if (knn_final  > 100) knn_final  = 100;
 
-  const char *day_names[]   = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
-  const char *period_names[]= {"Early Morning", "Morning", "Afternoon", "Evening", "Night"};
+  const char *day_names[]    = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+  const char *period_names[] = {"Early Morning", "Morning", "Afternoon", "Evening", "Night"};
 
   Serial.println();
   Serial.println(F("=== MANUAL PREDICTION TEST ==="));
-  Serial.print(F("  Time: "));   Serial.print(hour); Serial.print(F(":00 (")); Serial.print(period_names[time_period]); Serial.println(F(")"));
-  Serial.print(F("  Day:  "));   Serial.println(day_names[day]);
-  Serial.print(F("  Light:"));   Serial.print(ambient); Serial.println(F(" lux"));
-  Serial.print(F("  Motion:"));  Serial.println(motion ? F("YES") : F("NO"));
-  Serial.print(F("  Pot:   ")); Serial.print(pot_value); Serial.print(F(" (offset ")); Serial.print(offset); Serial.println(F("%)"));
+  Serial.print(F("  Time : ")); Serial.print(hour); Serial.print(F(":"));
+  if (minute < 10) Serial.print('0'); Serial.print(minute);
+  Serial.print(F(" (")); Serial.print(period_names[getTimePeriod(hour)]); Serial.println(F(")"));
+  Serial.print(F("  Day  : ")); Serial.println(day_names[day]);
+  Serial.print(F("  Light: ")); Serial.print(ambient); Serial.println(F(" lux"));
+  Serial.print(F("  Motion:")); Serial.println(motion ? F("YES") : F("NO"));
+  Serial.print(F("  Pot  : ")); Serial.print(pot_value);
+  Serial.print(F(" (offset ")); Serial.print(offset); Serial.println(F("%)"));
 
   Serial.println();
   Serial.println(F("Model breakdown:"));
-  Serial.print(F("  Tree raw       : ")); Serial.println(tree_pred, 2);
-  Serial.print(F("  KNN correction : ")); Serial.println(correction, 2);
-  Serial.print(F("  Confidence     : ")); Serial.println(confidence, 3);
-  Serial.print(F("  KNN raw output : ")); Serial.println(knn_pred, 2);
-  Serial.print(F("  Neighbors used : ")); Serial.println(neighbors_used);
-  Serial.print(F("  Min distance   : "));
-  if (isinf(min_dist)) Serial.println(F("inf (no samples)"));
+  Serial.print(F("  Tree raw          : ")); Serial.println(tree_pred, 2);
+  Serial.print(F("  Eligible samples  : ")); Serial.print(eligible_count);
+  Serial.print(F(" (within +/-")); Serial.print(knn_cfg.time_window_min);
+  Serial.println(F(" min on same day)"));
+  Serial.print(F("  Neighbors used    : ")); Serial.println(neighbors_used);
+  Serial.print(F("  KNN correction    : ")); Serial.println(correction, 2);
+  Serial.print(F("  Confidence        : ")); Serial.println(confidence, 3);
+  Serial.print(F("  KNN raw output    : ")); Serial.println(knn_pred, 2);
+  Serial.print(F("  Min distance      : "));
+  if (isinf(min_dist)) Serial.println(F("inf (no eligible samples)"));
   else                 Serial.println(min_dist, 4);
 
   Serial.println();
-  Serial.print(F("  Final w/ pot : tree="));  Serial.print(tree_final, 2);
-  Serial.print(F("%  knn="));                  Serial.print(knn_final, 2);
+  Serial.print(F("  Final w/ pot : tree=")); Serial.print(tree_final, 2);
+  Serial.print(F("%  knn="));                Serial.print(knn_final, 2);
   Serial.println(F("%"));
   Serial.println();
 }
@@ -739,18 +812,20 @@ void cmdSamples() {
     Serial.println();
     return;
   }
-  const char *day_names[]    = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
-  const char *period_names[] = {"E.Morn", "Morn", "Aftern", "Even", "Night"};
+  const char *day_names[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
 
   Serial.print(F("Total: "));
   Serial.println(training_sample_count);
-  Serial.println(F(" #  | Ambient | Mot | Period | Day | Target% | Timestamp"));
+  Serial.println(F(" #  | Time  | Day | Ambient | Mot | Target% | Timestamp"));
   for (int i = 0; i < training_sample_count; i++) {
     const TrainingSample &s = samples_cache[i];
+    int hh = s.minute_of_day / 60;
+    int mm = s.minute_of_day % 60;
     char line[100];
-    sprintf(line, "%2d  | %7.1f |  %d  | %6s | %3s | %6.1f  | %lu",
-      i + 1, s.ambient_light, s.motion_detected,
-      period_names[s.time_period], day_names[s.day_of_week],
+    sprintf(line, "%2d  | %02d:%02d | %3s | %7.1f |  %d  | %6.1f  | %lu",
+      i + 1, hh, mm,
+      day_names[s.day_of_week],
+      s.ambient_light, s.motion_detected,
       s.target_brightness, (unsigned long)s.timestamp);
     Serial.println(line);
   }
@@ -763,10 +838,10 @@ void cmdKnnInfo() {
   Serial.print(F("  K (neighbors)        : ")); Serial.println(knn_cfg.k_neighbors);
   Serial.print(F("  sigma_kernel         : ")); Serial.println(knn_cfg.sigma_kernel, 4);
   Serial.print(F("  sigma_confidence     : ")); Serial.println(knn_cfg.sigma_confidence, 4);
+  Serial.print(F("  Time window (+/-)    : ")); Serial.print(knn_cfg.time_window_min); Serial.println(F(" min"));
   Serial.print(F("  Stored samples       : ")); Serial.println(training_sample_count);
-  Serial.print(F("  Effective K          : ")); Serial.println(min(knn_cfg.k_neighbors, training_sample_count));
-  Serial.println(F("  Distance metric: importance-weighted squared distance"));
-  Serial.println(F("  Categorical features (period, day) use 0/1 distance"));
+  Serial.println(F("  Eligibility gate     : same day_of_week AND |dt| <= window"));
+  Serial.println(F("  Distance metric      : ambient + motion (within-gate only)"));
   Serial.print(F("  AMBIENT_SCALE        : ")); Serial.println(AMBIENT_SCALE);
   Serial.println();
 }
@@ -776,18 +851,13 @@ void cmdModelInfo() {
   Serial.println(F("=== MODEL INFO ==="));
   Serial.println(F("Base model     : Decision Tree (2000 samples, FROZEN)"));
   Serial.println(F("Correction     : KNN residual over user samples"));
+  Serial.println(F("Gating         : same day_of_week + minute_of_day window"));
+  Serial.print  (F("Window         : +/-"));
+  Serial.print  (knn_cfg.time_window_min); Serial.println(F(" min"));
   Serial.print  (F("Stored samples : ")); Serial.println(training_sample_count);
   Serial.print  (F("Personalization: "));
   Serial.println(training_sample_count > 0 ? F("ACTIVE (Tree + KNN)")
                                            : F("INACTIVE (Tree only - no samples)"));
-  Serial.println();
-  Serial.println(F("Feature importance (used as KNN distance weights):"));
-  Serial.print(F("  Ambient   : ")); Serial.println(IMPORTANCE_AMBIENT, 4);
-  Serial.print(F("  Motion    : ")); Serial.println(IMPORTANCE_MOTION, 4);
-  Serial.print(F("  Sin(hour) : ")); Serial.println(IMPORTANCE_SIN_HOUR, 4);
-  Serial.print(F("  Cos(hour) : ")); Serial.println(IMPORTANCE_COS_HOUR, 4);
-  Serial.print(F("  Period    : ")); Serial.println(IMPORTANCE_TIME_PERIOD, 4);
-  Serial.print(F("  Day       : ")); Serial.println(IMPORTANCE_DAY_OF_WEEK, 4);
   Serial.println();
 }
 
@@ -813,15 +883,24 @@ void cmdHelp() {
   Serial.println(F("modelinfo       - model summary"));
   Serial.println(F("knninfo         - KNN configuration"));
   Serial.println(F("resetmodel      - alias of clearsamples"));
-  Serial.println(F("setk N          - set K neighbors (1..MAX)"));
-  Serial.println(F("setsigma X      - set kernel bandwidth (e.g. 0.25)"));
+  Serial.println(F("setk N          - K neighbors (1..MAX)"));
+  Serial.println(F("setsigma X      - kernel bandwidth (>0)"));
+  Serial.println(F("setwindow N     - time window in minutes (1..720)"));
+  Serial.println(F(""));
   Serial.println(F("addsample HH DD AMBIENT MOTION BRIGHTNESS"));
-  Serial.println(F("                  HH=0..23 DD=0(Mon)..6(Sun)"));
-  Serial.println(F("                  AMBIENT lux, MOTION 0/1, BRIGHTNESS 0..100"));
+  Serial.println(F("                  HH=0..23, DD=0(Mon)..6(Sun)"));
+  Serial.println(F("                  minute defaults to 00"));
+  Serial.println(F("addsample HH MM DD AMBIENT MOTION BRIGHTNESS"));
+  Serial.println(F("                  with explicit minute (MM=0..59)"));
   Serial.println(F("test HH DD AMBIENT MOTION POT"));
+  Serial.println(F("test HH MM DD AMBIENT MOTION POT"));
   Serial.println(F("                  POT raw 0..4095 (2048=center)"));
   Serial.println();
 }
+
+// ============================================
+// SERIAL COMMAND DISPATCH
+// ============================================
 
 void handleSerialCommand() {
   String command = Serial.readStringUntil('\n');
@@ -843,11 +922,7 @@ void handleSerialCommand() {
     cmdKnnInfo();
   }
   else if (command == "clearsamples" || command == "resetmodel") {
-    training_sample_count = 0;
-    next_write_idx        = 0;
-    EEPROM.put(EEPROM_SAMPLE_COUNT_ADDR,   training_sample_count);
-    EEPROM.put(EEPROM_NEXT_WRITE_IDX_ADDR, next_write_idx);
-    EEPROM.commit();
+    wipeAllSamples();
     Serial.println();
     Serial.println(F("[v] All samples cleared. Tree-only mode active."));
     Serial.println();
@@ -872,37 +947,80 @@ void handleSerialCommand() {
       Serial.print(F("[v] sigma_kernel set to ")); Serial.println(s, 4);
     }
   }
-  else if (command.startsWith("addsample ")) {
-    int   hour, day, motion;
-    float ambient, brightness;
-    int parsed = sscanf(command.c_str(), "addsample %d %d %f %d %f",
-                        &hour, &day, &ambient, &motion, &brightness);
-    if (parsed == 5) {
-      if (hour < 0 || hour > 23)         { Serial.println(F("[x] Hour 0..23")); return; }
-      if (day < 0 || day > 6)            { Serial.println(F("[x] Day 0..6"));   return; }
-      if (ambient < 0 || ambient > 100000){ Serial.println(F("[x] Ambient 0..100000")); return; }
-      if (motion != 0 && motion != 1)    { Serial.println(F("[x] Motion 0/1")); return; }
-      if (brightness < 0 || brightness > 100) { Serial.println(F("[x] Brightness 0..100")); return; }
-      addManualSample(hour, day, ambient, motion, brightness);
+  else if (command.startsWith("setwindow ")) {
+    int w = command.substring(10).toInt();
+    if (w < 1 || w > 720) {
+      Serial.println(F("[x] window must be 1..720 minutes"));
     } else {
-      Serial.println(F("[x] Use: addsample HH DD AMBIENT MOTION BRIGHTNESS"));
+      knn_cfg.time_window_min = w;
+      saveKnnConfig();
+      Serial.print(F("[v] time window set to +/-"));
+      Serial.print(w); Serial.println(F(" min"));
     }
   }
-  else if (command.startsWith("test ")) {
-    int   hour, day, motion, pot;
-    float ambient;
-    int parsed = sscanf(command.c_str(), "test %d %d %f %d %d",
-                        &hour, &day, &ambient, &motion, &pot);
-    if (parsed == 5) {
-      if (hour < 0 || hour > 23)            { Serial.println(F("[x] Hour 0..23")); return; }
-      if (day < 0 || day > 6)               { Serial.println(F("[x] Day 0..6"));   return; }
-      if (ambient < 0 || ambient > 100000)  { Serial.println(F("[x] Ambient 0..100000")); return; }
-      if (motion != 0 && motion != 1)       { Serial.println(F("[x] Motion 0/1")); return; }
-      if (pot < 0 || pot > 4095)            { Serial.println(F("[x] Pot 0..4095")); return; }
-      testManualPrediction(hour, day, ambient, motion, pot);
-    } else {
-      Serial.println(F("[x] Use: test HH DD AMBIENT MOTION POT"));
+  else if (command.startsWith("addsample ")) {
+    int hh, mm, dd, mot;
+    float amb, br;
+
+    // Try 6-arg form: HH MM DD AMB MOT BR
+    int p6 = sscanf(command.c_str(), "addsample %d %d %d %f %d %f",
+                    &hh, &mm, &dd, &amb, &mot, &br);
+    bool used6 = false;
+    if (p6 == 6) {
+      if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59 &&
+          dd >= 0 && dd <= 6  && amb >= 0 && amb <= 100000 &&
+          (mot == 0 || mot == 1) && br >= 0 && br <= 100) {
+        used6 = true;
+      }
     }
+    if (!used6) {
+      // 5-arg form: HH DD AMB MOT BR  (minute = 0)
+      int p5 = sscanf(command.c_str(), "addsample %d %d %f %d %f",
+                      &hh, &dd, &amb, &mot, &br);
+      mm = 0;
+      if (p5 == 5) {
+        if (hh < 0  || hh > 23)             { Serial.println(F("[x] Hour 0..23")); return; }
+        if (dd < 0  || dd > 6)              { Serial.println(F("[x] Day 0..6"));   return; }
+        if (amb < 0 || amb > 100000)        { Serial.println(F("[x] Ambient 0..100000")); return; }
+        if (mot != 0 && mot != 1)           { Serial.println(F("[x] Motion 0/1")); return; }
+        if (br < 0  || br > 100)            { Serial.println(F("[x] Brightness 0..100")); return; }
+      } else {
+        Serial.println(F("[x] Use: addsample HH [MM] DD AMBIENT MOTION BRIGHTNESS"));
+        return;
+      }
+    }
+    addManualSample(hh, mm, dd, amb, mot, br);
+  }
+  else if (command.startsWith("test ")) {
+    int hh, mm, dd, mot, pot;
+    float amb;
+
+    int p6 = sscanf(command.c_str(), "test %d %d %d %f %d %d",
+                    &hh, &mm, &dd, &amb, &mot, &pot);
+    bool used6 = false;
+    if (p6 == 6) {
+      if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59 &&
+          dd >= 0 && dd <= 6  && amb >= 0 && amb <= 100000 &&
+          (mot == 0 || mot == 1) && pot >= 0 && pot <= 4095) {
+        used6 = true;
+      }
+    }
+    if (!used6) {
+      int p5 = sscanf(command.c_str(), "test %d %d %f %d %d",
+                      &hh, &dd, &amb, &mot, &pot);
+      mm = 0;
+      if (p5 == 5) {
+        if (hh < 0  || hh > 23)             { Serial.println(F("[x] Hour 0..23")); return; }
+        if (dd < 0  || dd > 6)              { Serial.println(F("[x] Day 0..6"));   return; }
+        if (amb < 0 || amb > 100000)        { Serial.println(F("[x] Ambient 0..100000")); return; }
+        if (mot != 0 && mot != 1)           { Serial.println(F("[x] Motion 0/1")); return; }
+        if (pot < 0 || pot > 4095)          { Serial.println(F("[x] Pot 0..4095")); return; }
+      } else {
+        Serial.println(F("[x] Use: test HH [MM] DD AMBIENT MOTION POT"));
+        return;
+      }
+    }
+    testManualPrediction(hh, mm, dd, amb, mot, pot);
   }
   else if (command.length() > 0) {
     Serial.print(F("[x] Unknown: ")); Serial.println(command);
